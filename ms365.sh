@@ -152,31 +152,82 @@ REG
   umu regedit /S "$reg"
 }
 
-# Wine's sppc.dll (Software Protection Platform client) is stubs; the Office integrator aborts in
-# SLInstallLicense (click-to-run error 0-2031 / 17002). Drop in our shim and force it native.
-install_sppc_shim() {
-  [ "$MS365_EDITION" = 64 ] || { warn "sppc shim is x86_64 only; 32-bit Office will hit the SLInstallLicense stub"; return 0; }
+# Native DLL shims (x86_64 only; see sppc/ and ole32-shim/ in the flake):
+#  - sppc.dll: Wine's Software Protection Platform client is stubs; the Office integrator aborts in
+#    SLInstallLicense (click-to-run error 0-2031 / 17002). Ours accepts licences and reports none.
+#  - ole32.dll: forwarder that adds CoRegisterActivationFilter (mso30win32client GetProcAddress's it
+#    and dereferences NULL). The real builtin is kept alongside as ole32_wine.dll.
+ole32_shim_for_runner() {
+  case "$MS365_RUNNER" in
+    protosoda|soda) echo "$MS365_OLE32_SHIM_SODA" ;;
+    *)              echo "$MS365_OLE32_SHIM_GE" ;;
+  esac
+}
+
+put_dll() { # put_dll <src> <system32 name>
   local root; root="$(win_prefix_root)"
-  local dst="$root/drive_c/windows/system32/sppc.dll"
-  if [ ! -f "$dst" ] || [ -L "$dst" ] || ! cmp -s "$MS365_SPPC_SHIM" "$dst"; then
-    log "Installing sppc.dll shim into system32"
+  local dst="$root/drive_c/windows/system32/$2"
+  if [ ! -f "$dst" ] || [ -L "$dst" ] || ! cmp -s "$1" "$dst"; then
+    log "Installing $2 into system32"
     rm -f "$dst"
-    cp -f "$MS365_SPPC_SHIM" "$dst"
+    cp -f "$1" "$dst"
     chmod 644 "$dst"
   fi
-  local reg="$ODT_DIR/sppc-override.reg"
+}
+
+install_shims() {
+  [ "$MS365_EDITION" = 64 ] || { warn "DLL shims are x86_64 only; 32-bit Office will hit the SLInstallLicense stub"; return 0; }
+  put_dll "$MS365_SPPC_SHIM" sppc.dll
+  put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
+  put_dll "$(ole32_shim_for_runner)" ole32.dll
+  local reg="$ODT_DIR/shim-overrides.reg"
   mkdir -p "$ODT_DIR"
   cat > "$reg" <<'REG'
 Windows Registry Editor Version 5.00
 
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "sppc"="native"
+"ole32"="native,builtin"
 REG
   umu regedit /S "$reg"
-  printf 'sppc=native' > "$MS365_PREFIX/.ms365-sppc"
+  printf 'sppc,ole32' > "$MS365_PREFIX/.ms365-shims"
+}
+
+# Office keeps most of its DLLs under root/vfs/<KnownFolder>/... and relies on the App-V ISV layer to
+# redirect file access from the real paths (C:\Program Files\Common Files\...) into that tree. Under
+# Wine that redirection is not reliable, so mirror the tree into place with symlinks (only where nothing
+# exists yet). MS365_MIRROR_VFS=0 disables this.
+mirror_vfs() {
+  [ "${MS365_MIRROR_VFS:-1}" != 0 ] || return 0
+  local root; root="$(win_prefix_root)"
+  local vfs="$root/drive_c/Program Files/Microsoft Office/root/vfs"
+  [ -d "$vfs" ] || return 0
+  local n=0
+  link_tree() { # link_tree <src dir> <dst dir>
+    local src="$1" dst="$2" e name
+    [ -d "$src" ] || return 0
+    mkdir -p "$dst"
+    for e in "$src"/*; do
+      [ -e "$e" ] || continue
+      name="${e##*/}"
+      if [ ! -e "$dst/$name" ]; then
+        ln -s "$e" "$dst/$name" && n=$((n+1))
+      elif [ -d "$e" ] && [ -d "$dst/$name" ] && [ ! -L "$dst/$name" ]; then
+        link_tree "$e" "$dst/$name"
+      fi
+    done
+  }
+  link_tree "$vfs/ProgramFilesCommonX64" "$root/drive_c/Program Files/Common Files"
+  link_tree "$vfs/ProgramFilesCommonX86" "$root/drive_c/Program Files (x86)/Common Files"
+  link_tree "$vfs/ProgramFilesX64"       "$root/drive_c/Program Files"
+  link_tree "$vfs/ProgramFilesX86"       "$root/drive_c/Program Files (x86)"
+  link_tree "$vfs/Fonts"                 "$root/drive_c/windows/Fonts"
+  [ "$n" -gt 0 ] && log "Mirrored $n VFS entries into their real locations"
+  return 0
 }
 
 post_install_fixups() {
+  mirror_vfs
   # 64-bit analogue of the classic ruados/eylenburg fix: the app-v subsystem DLLs must sit next
   # to the Office binaries or WINWORD etc. die on startup under Wine.
   local bits="$MS365_EDITION"
@@ -210,7 +261,7 @@ cmd_install() {
   C2R_DIR="$root/drive_c/Program Files/Common Files/Microsoft Shared/ClickToRun"
   apply_tricks
   apply_registry
-  install_sppc_shim
+  install_shims
   write_config
   fetch_odt
   local phase="${1:-all}"
@@ -242,10 +293,12 @@ cmd_run() {
   local root; root="$(win_prefix_root)"
   local path="$root/drive_c/Program Files/Microsoft Office/root/Office16/$exe"
   [ -f "$path" ] || die "$exe not installed (expected $path). Run: ms365 install"
-  # a Proton version bump re-links system32; make sure the shim is still in place
-  local dll="$root/drive_c/windows/system32/sppc.dll"
-  if [ "$MS365_EDITION" = 64 ] && { [ -L "$dll" ] || ! cmp -s "$MS365_SPPC_SHIM" "$dll"; }; then
-    rm -f "$dll"; cp -f "$MS365_SPPC_SHIM" "$dll"; chmod 644 "$dll"
+  # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
+  # the registry overrides persist, only the files need re-checking)
+  if [ "$MS365_EDITION" = 64 ]; then
+    put_dll "$MS365_SPPC_SHIM" sppc.dll
+    put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
+    put_dll "$(ole32_shim_for_runner)" ole32.dll
   fi
   exec umu-run "$path" "$@"
 }
