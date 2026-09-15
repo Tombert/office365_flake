@@ -45,6 +45,10 @@ umu_env() {
   # Office wants an X11 surface; GE-Proton 11 ships winewayland too, prefer X11 unless overridden.
   export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
   mkdir -p "$MS365_PREFIX" "$LOG_DIR"
+  # MS365_DEBUG=1 turns on Proton's wine log (+seh etc.) -> $LOG_DIR/steam-<appid>.log
+  if [ "${MS365_DEBUG:-0}" != 0 ]; then
+    export PROTON_LOG=1 PROTON_LOG_DIR="$LOG_DIR"
+  fi
 }
 
 umu() { umu_env; umu-run "$@"; }
@@ -132,6 +136,17 @@ Windows Registry Editor Version 5.00
 ; Office C2R checks for the SLC/SPP licensing platform; mark it present so the installer proceeds.
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform]
 "Version"="10.0.19041.1"
+
+; Wine's WinRT PackageManager (appxdeploymentclient) is a stub that returns E_NOINTERFACE for the
+; IPackageManager revision Office asks for, and OfficeClickToRun then dereferences NULL while staging
+; MSIX add-ons in its LastRun task. With the library unavailable Office logs an error and moves on.
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"appxdeploymentclient"=""
+
+; Verbose Windows Installer logs (MSI*.log in %TEMP%) so integrator MSI failures are diagnosable.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Installer]
+"Logging"="voicewarmupx"
+"Debug"=dword:00000007
 REG
   log "Applying registry tweaks"
   umu regedit /S "$reg"
@@ -296,6 +311,7 @@ Environment (all optional):
   MS365_EXCLUDE   ExcludeApp ids    (default "Teams OneDrive Lync Bing Groove")
   MS365_WINETRICKS verbs applied before install (default "corefonts msxml6 riched20 gdiplus")
   MS365_ODT_SETUP path to a local ODT setup.exe instead of downloading
+  MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   UMU_LOG=debug   verbose umu output
 USG
 }
