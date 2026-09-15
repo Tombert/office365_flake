@@ -156,7 +156,8 @@ REG
 #  - sppc.dll: Wine's Software Protection Platform client is stubs; the Office integrator aborts in
 #    SLInstallLicense (click-to-run error 0-2031 / 17002). Ours accepts licences and reports none.
 #  - ole32.dll: forwarder that adds CoRegisterActivationFilter (mso30win32client GetProcAddress's it
-#    and dereferences NULL). The real builtin is kept alongside as ole32_wine.dll.
+#    and dereferences NULL) and, from its DllMain, patches other Wine stubs Office calls (see
+#    ole32-shim/shim.c). The real builtin is kept alongside as ole32_wine.dll.
 ole32_shim_for_runner() {
   case "$MS365_RUNNER" in
     protosoda|soda) echo "$MS365_OLE32_SHIM_SODA" ;;
@@ -188,6 +189,7 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "sppc"="native"
 "ole32"="native,builtin"
+
 REG
   umu regedit /S "$reg"
   printf 'sppc,ole32' > "$MS365_PREFIX/.ms365-shims"
