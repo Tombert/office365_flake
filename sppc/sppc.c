@@ -106,12 +106,16 @@ NOT_FOUND_GETTER(SLGetPKeyInformation)
 NOT_FOUND_GETTER(SLGetProductSkuInformation)
 NOT_FOUND_GETTER(SLGetLicenseInformation)
 NOT_FOUND_GETTER(SLGetApplicationInformation)
-NOT_FOUND_GETTER(SLGetPolicyInformation)
-NOT_FOUND_GETTER(SLGetApplicationPolicy)
+
+/* policy getters take a policy handle and no SLID: (h, name, type*, size*, data**) */
+API SLGetPolicyInformation(HSLP h, PCWSTR value, int *type, UINT *size, PBYTE *data)
+{ (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+API SLGetApplicationPolicy(HSLP h, PCWSTR value, int *type, UINT *size, PBYTE *data)
+{ (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
 
 API SLGetServiceInformation(HSLC h, PCWSTR value, int *type, UINT *size, PBYTE *data)
 { (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
-API SLGetPolicyInformationDWORD(HSLC h, PCWSTR value, DWORD *out)
+API SLGetPolicyInformationDWORD(HSLP h, PCWSTR value, DWORD *out)
 { (void)h; (void)value; if (out) *out = 0; return SL_E_VALUE_NOT_FOUND; }
 API SLGetGenuineInformation(const SLID *id, PCWSTR value, int *type, UINT *size, PBYTE *data)
 { (void)id; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
