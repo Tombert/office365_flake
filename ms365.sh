@@ -214,13 +214,16 @@ cmd_install() {
   write_config
   fetch_odt
   local phase="${1:-all}"
+  case "$phase" in all|download|configure|fixup) ;; *) die "install phase must be download, configure or fixup" ;; esac
+  # setup.exe's exit status is not a reliable success signal under Proton (a successful install has
+  # returned 3 here), so run each phase without -e/pipefail and judge by what landed on disk.
   if [ "$phase" = all ] || [ "$phase" = download ]; then
     log "ODT /download  (Office payload goes to $ODT_DIR/Office, several GB)"
-    umu "$ODT_DIR/setup.exe" /download "C:\\odt\\configuration.xml" 2>&1 | tee "$LOG_DIR/odt-download.log"
+    umu "$ODT_DIR/setup.exe" /download "C:\\odt\\configuration.xml" 2>&1 | tee "$LOG_DIR/odt-download.log" || true
   fi
   if [ "$phase" = all ] || [ "$phase" = configure ]; then
     log "ODT /configure  (click-to-run installer; leave the window alone)"
-    umu "$ODT_DIR/setup.exe" /configure "C:\\odt\\configuration.xml" 2>&1 | tee "$LOG_DIR/odt-configure.log"
+    umu "$ODT_DIR/setup.exe" /configure "C:\\odt\\configuration.xml" 2>&1 | tee "$LOG_DIR/odt-configure.log" || true
   fi
   post_install_fixups
   if [ -f "$OFFICE_ROOT/WINWORD.EXE" ]; then
@@ -292,7 +295,9 @@ usage() {
   cat <<USG
 ms365 -- Microsoft 365 through umu-launcher + Proton
 
-  ms365 install [download|configure]  create prefix, winetricks, fetch ODT, download + install Office
+  ms365 install [download|configure|fixup]
+                                      create prefix, winetricks, fetch ODT, download + install Office
+                                      (a single phase reruns just that step; fixup = post-install DLL copies)
   ms365 run <app> [files...]          word excel powerpoint outlook onenote access publisher
   ms365 winetricks <verbs...>         run winetricks verbs in the prefix
   ms365 exec <exe|cmd> [args...]      run any exe (or wine builtin: cmd, regedit, winecfg, control)
