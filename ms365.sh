@@ -288,6 +288,13 @@ cmd_install() {
   fi
 }
 
+app_regname() {
+  case "$1" in
+    word) echo Word ;; excel) echo Excel ;; powerpoint) echo PowerPoint ;; outlook) echo Outlook ;;
+    onenote) echo OneNote ;; access) echo Access ;; publisher) echo Publisher ;;
+  esac
+}
+
 cmd_run() {
   local app="${1:-word}"; shift || true
   local exe; exe="$(app_exe "$app")"
@@ -295,6 +302,15 @@ cmd_run() {
   local root; root="$(win_prefix_root)"
   local path="$root/drive_c/Program Files/Microsoft Office/root/Office16/$exe"
   [ -f "$path" ] || die "$exe not installed (expected $path). Run: ms365 install"
+  # After a crash Office offers "safe mode" via a modal prompt on the next start. Crashes are a fact
+  # of life under Wine, so clear that flag unless MS365_KEEP_SAFEMODE_PROMPT=1. Only spend an extra
+  # umu round-trip when the key is actually present in the hive.
+  local regname; regname="$(app_regname "$app")"
+  local hivekey; hivekey='Office\\16.0\\'"$regname"'\\Resiliency'   # hives escape backslashes
+  if [ "${MS365_KEEP_SAFEMODE_PROMPT:-0}" = 0 ] && grep -aqF "$hivekey" "$root/user.reg" 2>/dev/null; then
+    log "clearing $regname safe-mode prompt from the last crash"
+    umu reg delete "HKCU\\Software\\Microsoft\\Office\\16.0\\$regname\\Resiliency" /f >/dev/null 2>&1 || true
+  fi
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
   if [ "$MS365_EDITION" = 64 ]; then
@@ -372,6 +388,7 @@ Environment (all optional):
   MS365_WINETRICKS verbs applied before install (default "corefonts msxml6 riched20 gdiplus")
   MS365_ODT_SETUP path to a local ODT setup.exe instead of downloading
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
+  MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   UMU_LOG=debug   verbose umu output
 USG
 }
