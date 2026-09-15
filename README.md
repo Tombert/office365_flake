@@ -1,0 +1,73 @@
+# Microsoft 365 on Linux via umu + GE-Proton (Nix flake)
+
+Microsoft 365 (click-to-run Office) famously does not work on stock Wine. This flake is a
+best-effort attempt to run it through **umu-launcher** with **GE-Proton** (the Wine build that
+Valve/GloriousEggroll ship for games) instead, with the Bottles project's **ProtoSoda** Wine core
+available as a second runner. It packages nothing from Microsoft: the Office Deployment Tool and
+Office itself are downloaded at install time by the `ms365` script. You need a Microsoft 365
+licence to sign in.
+
+## Where the recipe comes from
+
+* A February 2026 report in the Bottles tracker of Office 365 x64 running on Wine 10.20 with
+  `corefonts msxml6 riched20 gdiplus`, the Office Deployment Tool and a couple of DLL copies.
+* The classic ruados / eylenburg Office-on-Wine notes (Direct2D registry tweak, copying the
+  `AppvIsvSubsystems*` and `C2R*` DLLs next to the Office binaries).
+* The September 2026 Bottles announcement that Microsoft 365 installs, signs in (with 2FA) and runs
+  Word on their Soda 11 Wine core in a Windows 10 prefix. GE-Proton 11 is the same Wine 11
+  bleeding-edge lineage, and ProtoSoda is that Soda core in Proton layout, so both are offered.
+
+## Usage
+
+```sh
+nix run .#ms365 -- install        # create prefix, winetricks, fetch ODT, download + install Office
+nix run .#word                    # or: nix run .#ms365 -- run word ~/doc.docx
+nix run .#ms365 -- status
+nix run .#ms365 -- help
+```
+
+Or install it: `nix profile install .#ms365` gives you `ms365`, `ms365-word`, `ms365-excel`, ...
+plus `.desktop` entries.
+
+The install downloads several GB into `~/.local/share/ms365/odt/Office` and then runs the
+click-to-run installer inside the prefix. Leave the installer window alone; it looks frozen for
+long stretches.
+
+## Knobs
+
+All optional, all environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MS365_RUNNER` | `ge` | `ge` (nixpkgs `proton-ge-bin`), `protosoda` (Bottles Soda core), or an absolute Proton dir |
+| `MS365_PREFIX` | `~/.local/share/ms365/prefix` | Proton compat-data dir (Wine prefix lives in `pfx/`) |
+| `MS365_PRODUCT` | `O365ProPlusRetail` | ODT product id (`O365BusinessRetail`, `O365HomePremRetail`, `ProPlus2024Retail`, ...) |
+| `MS365_CHANNEL` | `Current` | Update channel |
+| `MS365_VERSION` | unset | Pin an Office build, e.g. `16.0.18129.20158`. Older builds are less likely to trip Wine |
+| `MS365_EDITION` | `64` | `64` or `32` |
+| `MS365_LANG` | `en-us` | Language |
+| `MS365_EXCLUDE` | `Teams OneDrive Lync Bing Groove` | ODT `ExcludeApp` ids. Add `Outlook OneNote Access Publisher` for a minimal install |
+| `MS365_WINETRICKS` | `corefonts msxml6 riched20 gdiplus` | Verbs applied before install |
+| `MS365_ODT_SETUP` | unset | Use a local ODT `setup.exe` instead of downloading the current one |
+| `UMU_LOG` | unset | `1` or `debug` for umu output |
+
+Example, try the Soda core with a minimal install:
+
+```sh
+MS365_RUNNER=protosoda MS365_EXCLUDE="Teams OneDrive Lync Bing Groove Outlook OneNote Access Publisher" \
+  nix run .#ms365 -- install
+```
+
+## Debugging
+
+* Logs: `~/.local/share/ms365/logs/` (umu/wine stderr) and `~/.local/share/ms365/odt/logs/` (ODT).
+* `ms365 exec regedit`, `ms365 exec winecfg`, `ms365 exec cmd`, `ms365 winetricks <verbs>`.
+* `ms365 install download` / `ms365 install configure` rerun a single phase.
+* `ms365 reset --yes` deletes the prefix but keeps the downloaded Office payload.
+* If a run wedges, `ms365 kill`.
+
+## Expectations
+
+This is the college try, not a guarantee. Things that historically break: Microsoft account sign-in
+(WebView2/Edge based), OneNote, Teams, and anything touching WinRT `Windows.*` APIs. If the
+installer dies early, pin an older build with `MS365_VERSION`, or switch runners.
