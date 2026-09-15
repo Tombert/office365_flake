@@ -43,8 +43,10 @@
         };
       };
 
+      sppcShim = pkgs.callPackage ./sppc { };
+
       ms365 = pkgs.callPackage ./ms365.nix {
-        inherit protonGE protosoda;
+        inherit protonGE protosoda sppcShim;
       };
 
       mkApp = exe: { type = "app"; program = "${ms365}/bin/${exe}"; };
@@ -52,7 +54,7 @@
     {
       packages.${system} = {
         default = ms365;
-        inherit ms365 protosoda protonGE;
+        inherit ms365 protosoda protonGE sppcShim;
       };
 
       apps.${system} = {

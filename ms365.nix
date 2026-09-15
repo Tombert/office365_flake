@@ -9,6 +9,7 @@
 , gnused
 , protonGE
 , protosoda
+, sppcShim
 }:
 
 let
@@ -28,7 +29,8 @@ let
     text = ''
       MS365_PROTON_GE=${protonGE}
       MS365_PROTOSODA=${protosoda}
-      export MS365_PROTON_GE MS365_PROTOSODA
+      MS365_SPPC_SHIM=${sppcShim}/lib/wine/x86_64-windows/sppc.dll
+      export MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM
       ${builtins.readFile ./ms365.sh}
     '';
   };

@@ -108,12 +108,19 @@ fetch_odt() {
 
 apply_tricks() {
   [ -z "$MS365_WINETRICKS" ] && return 0
+  local marker="$MS365_PREFIX/.ms365-winetricks"
+  if [ -f "$marker" ] && [ "$(cat "$marker")" = "$MS365_WINETRICKS" ]; then
+    log "winetricks already applied ($MS365_WINETRICKS)"
+    return 0
+  fi
   log "winetricks: $MS365_WINETRICKS (this can take a while)"
   # shellcheck disable=SC2086
   umu winetricks -q $MS365_WINETRICKS
+  printf '%s' "$MS365_WINETRICKS" > "$marker"
 }
 
 apply_registry() {
+  mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
   cat > "$reg" <<'REG'
 Windows Registry Editor Version 5.00
@@ -128,6 +135,30 @@ Windows Registry Editor Version 5.00
 REG
   log "Applying registry tweaks"
   umu regedit /S "$reg"
+}
+
+# Wine's sppc.dll (Software Protection Platform client) is stubs; the Office integrator aborts in
+# SLInstallLicense (click-to-run error 0-2031 / 17002). Drop in our shim and force it native.
+install_sppc_shim() {
+  [ "$MS365_EDITION" = 64 ] || { warn "sppc shim is x86_64 only; 32-bit Office will hit the SLInstallLicense stub"; return 0; }
+  local root; root="$(win_prefix_root)"
+  local dst="$root/drive_c/windows/system32/sppc.dll"
+  if [ ! -f "$dst" ] || [ -L "$dst" ] || ! cmp -s "$MS365_SPPC_SHIM" "$dst"; then
+    log "Installing sppc.dll shim into system32"
+    rm -f "$dst"
+    cp -f "$MS365_SPPC_SHIM" "$dst"
+    chmod 644 "$dst"
+  fi
+  local reg="$ODT_DIR/sppc-override.reg"
+  mkdir -p "$ODT_DIR"
+  cat > "$reg" <<'REG'
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"sppc"="native"
+REG
+  umu regedit /S "$reg"
+  printf 'sppc=native' > "$MS365_PREFIX/.ms365-sppc"
 }
 
 post_install_fixups() {
@@ -164,6 +195,7 @@ cmd_install() {
   C2R_DIR="$root/drive_c/Program Files/Common Files/Microsoft Shared/ClickToRun"
   apply_tricks
   apply_registry
+  install_sppc_shim
   write_config
   fetch_odt
   local phase="${1:-all}"
@@ -192,12 +224,33 @@ cmd_run() {
   local root; root="$(win_prefix_root)"
   local path="$root/drive_c/Program Files/Microsoft Office/root/Office16/$exe"
   [ -f "$path" ] || die "$exe not installed (expected $path). Run: ms365 install"
+  # a Proton version bump re-links system32; make sure the shim is still in place
+  local dll="$root/drive_c/windows/system32/sppc.dll"
+  if [ "$MS365_EDITION" = 64 ] && { [ -L "$dll" ] || ! cmp -s "$MS365_SPPC_SHIM" "$dll"; }; then
+    rm -f "$dll"; cp -f "$MS365_SPPC_SHIM" "$dll"; chmod 644 "$dll"
+  fi
   exec umu-run "$path" "$@"
 }
 
 cmd_winetricks() { umu_env; ensure_prefix; umu winetricks "$@"; }
 cmd_exec()       { umu_env; ensure_prefix; umu "$@"; }
-cmd_kill()       { umu_env; umu wineserver -k || true; }
+cmd_kill() {
+  # umu can't run a bare 'wineserver -k' (it wants an exe), and the wineserver socket lives inside the
+  # runtime container, so find every process whose environment carries our prefix and signal it.
+  local sig n
+  for sig in TERM KILL; do
+    n=0
+    for p in /proc/[0-9]*; do
+      [ -r "$p/environ" ] || continue
+      if tr '\0' '\n' 2>/dev/null < "$p/environ" | grep -q "^WINEPREFIX=$MS365_PREFIX\$"; then
+        kill "-$sig" "${p#/proc/}" 2>/dev/null && n=$((n+1))
+      fi
+    done
+    [ "$n" -eq 0 ] && break
+    log "sent SIG$sig to $n process(es)"
+    sleep 2
+  done
+}
 
 cmd_status() {
   umu_env
