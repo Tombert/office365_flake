@@ -119,6 +119,48 @@ static void patch_module(HMODULE h, const char *modname)
     }
 }
 
+/* ---- exports to hide ------------------------------------------------------------------------
+ * Some APIs exist in this Wine but misbehave; Office probes them with GetProcAddress and has a
+ * fallback for Windows builds that lack them. Renaming the export in the in-memory name table
+ * (last character bumped, so the sorted order GetProcAddress relies on is preserved) makes the
+ * probe fail cleanly.
+ *  - QueueUserAPC2: mso30win32client queues special user APCs (flag 1); Wine dispatches them with
+ *    the wrong calling convention and Office's APC routine raises fatal 0xE0000002. */
+static const struct { const char *dll; const char *fn; } HIDE[] = {
+    { "kernel32.dll",   "QueueUserAPC2" },
+    { "kernelbase.dll", "QueueUserAPC2" },
+};
+
+static void hide_export(const char *dllname, const char *name)
+{
+    HMODULE h = GetModuleHandleA(dllname);
+    if (!h) return;
+    BYTE *base = (BYTE *)h;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress) return;
+    IMAGE_EXPORT_DIRECTORY *ed = (IMAGE_EXPORT_DIRECTORY *)(base + dd.VirtualAddress);
+    DWORD *names = (DWORD *)(base + ed->AddressOfNames);
+    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+        char *n = (char *)(base + names[i]);
+        if (strcmp(n, name) != 0) continue;
+        size_t len = strlen(n);
+        char last = n[len - 1];
+        const char *next = (i + 1 < ed->NumberOfNames) ? (const char *)(base + names[i + 1]) : NULL;
+        char tmp[128];
+        if (len >= sizeof(tmp)) return;
+        memcpy(tmp, n, len + 1);
+        tmp[len - 1] = last + 1;
+        if (next && strcmp(tmp, next) >= 0) { dbg("cannot hide (order)", dllname, name); return; }
+        DWORD old;
+        if (!VirtualProtect(n, len + 1, PAGE_READWRITE, &old)) { dbg("cannot hide (protect)", dllname, name); return; }
+        n[len - 1] = last + 1;
+        VirtualProtect(n, len + 1, old, &old);
+        dbg("hid export", dllname, name);
+        return;
+    }
+}
+
 /* Loader notification (ntdll.LdrRegisterDllNotification; Wine implements it). */
 typedef struct {
     ULONG Flags;
@@ -173,6 +215,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (reg) reg(0, on_dll_notify, NULL, &notify_cookie);
         else OutputDebugStringA("ms365 ole32 shim: LdrRegisterDllNotification unavailable");
         patch_loaded_modules();
+        for (size_t i = 0; i < sizeof(HIDE) / sizeof(HIDE[0]); i++) hide_export(HIDE[i].dll, HIDE[i].fn);
     }
     return TRUE;
 }
