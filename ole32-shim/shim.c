@@ -3,15 +3,23 @@
  *
  * 1. Exports: every export of the builtin ole32 is forwarded (see gen-def.py) to combase or to
  *    ole32_wine.dll (a renamed copy of the builtin), plus entry points the builtin lacks.
- * 2. Stub patching: Wine marks unimplemented functions as stubs that raise a non-continuable
- *    exception, which kills Office. Since ole32 is loaded early by every Office process, DllMain
- *    overwrites the first bytes of each listed stub with a jump to a replacement that behaves the
- *    way the real API does for an unprivileged caller.
  *
- * x86_64 only. Add entries to PATCHES as new "unimplemented function X.Y called" aborts turn up.
+ * 2. Missing-import patching: when a module imports a function that Wine's kernel32 (etc.) does
+ *    not export at all, the Wine loader binds the import to a generated stub that raises a
+ *    non-continuable exception on first call, which kills Office. Since ole32 is loaded early by
+ *    every Office process, this DLL registers a loader notification and, for every module loaded
+ *    from then on (and everything already loaded), rewrites the import-table slots of the
+ *    functions listed in PATCHES to point at replacements that behave the way the real API does
+ *    for an unprivileged caller.
+ *
+ * x86_64 only. Add entries to PATCHES as new "unimplemented function X.Y called" aborts turn up;
+ * WINEDEBUG=+module (MS365_DEBUG=+module) lists every unresolved import as "No implementation for".
  */
 #include <windows.h>
+#include <winternl.h>
 #include <string.h>
+
+/* ---- replacements ------------------------------------------------------------------------ */
 
 /* mso30win32client GetProcAddress's this from ole32 and dereferences the result unconditionally.
  * Activation filters only matter for app-container activation; accept and ignore. */
@@ -36,34 +44,135 @@ static BOOL WINAPI my_SetFileShortNameA(HANDLE file, LPCSTR name)
     return FALSE;
 }
 
+/* Windows 8+ packaged-app query; report "no packages" (ERROR_SUCCESS with zero results), which is
+ * what an unpackaged desktop Office sees on a machine without the queried family installed. */
+static LONG WINAPI my_FindPackagesByPackageFamily(PCWSTR family, UINT32 flags, UINT32 *count,
+                                                  PWSTR *names, UINT32 *buflen, PWSTR buf, UINT32 *props)
+{
+    (void)family; (void)flags; (void)names; (void)buf; (void)props;
+    if (count) *count = 0;
+    if (buflen) *buflen = 0;
+    return ERROR_SUCCESS;
+}
+
+/* Windows 8+ variant that also reports whether the timer was previously set; Wine has the plain
+ * SetThreadpoolTimer, which is all aitrx.dll needs. */
+static BOOL WINAPI my_SetThreadpoolTimerEx(PTP_TIMER timer, PFILETIME due, DWORD period, DWORD window)
+{
+    SetThreadpoolTimer(timer, due, period, window);
+    return FALSE;
+}
+
 struct patch { const char *dll; const char *fn; void *repl; };
 static const struct patch PATCHES[] = {
-    { "kernel32.dll", "SetFileShortNameW", (void *)my_SetFileShortNameW },
-    { "kernel32.dll", "SetFileShortNameA", (void *)my_SetFileShortNameA },
+    { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
+    { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
+    { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
+    { "kernel32.dll", "SetThreadpoolTimerEx",        (void *)my_SetThreadpoolTimerEx },
 };
+#define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
-static void apply(const struct patch *p)
+/* ---- machinery --------------------------------------------------------------------------- */
+
+static void dbg(const char *what, const char *mod, const char *fn)
 {
-    HMODULE h = GetModuleHandleA(p->dll);
-    if (!h) return; /* only patch what is already loaded; never LoadLibrary under the loader lock */
-    BYTE *fn = (BYTE *)GetProcAddress(h, p->fn);
-    if (!fn) return;
-    if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) return; /* done before */
-    DWORD old;
-    if (!VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old)) return;
-    fn[0] = 0x48; fn[1] = 0xB8;                    /* mov rax, imm64 */
-    memcpy(fn + 2, &p->repl, sizeof(void *));
-    fn[10] = 0xFF; fn[11] = 0xE0;                  /* jmp rax */
-    VirtualProtect(fn, 16, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), fn, 16);
+    char buf[320];
+    wsprintfA(buf, "ms365 ole32 shim: %s %s!%s", what, mod, fn);
+    OutputDebugStringA(buf);
 }
+
+static int ieq(const char *a, const char *b) { return lstrcmpiA(a, b) == 0; }
+
+/* Rewrite import slots of one module. */
+static void patch_module(HMODULE h, const char *modname)
+{
+    BYTE *base = (BYTE *)h;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dd.VirtualAddress || !dd.Size) return;
+    IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + dd.VirtualAddress);
+    for (; desc->Name; desc++) {
+        const char *dll = (const char *)(base + desc->Name);
+        size_t want = 0;
+        for (size_t i = 0; i < NPATCHES; i++) if (ieq(dll, PATCHES[i].dll)) want++;
+        if (!want) continue;
+        IMAGE_THUNK_DATA *ilt = (IMAGE_THUNK_DATA *)(base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
+        for (; ilt->u1.AddressOfData; ilt++, iat++) {
+            if (IMAGE_SNAP_BY_ORDINAL(ilt->u1.Ordinal)) continue;
+            IMAGE_IMPORT_BY_NAME *ibn = (IMAGE_IMPORT_BY_NAME *)(base + ilt->u1.AddressOfData);
+            const char *fn = (const char *)ibn->Name;
+            for (size_t i = 0; i < NPATCHES; i++) {
+                if (!ieq(dll, PATCHES[i].dll) || strcmp(fn, PATCHES[i].fn) != 0) continue;
+                if ((void *)iat->u1.Function == PATCHES[i].repl) break;
+                DWORD old;
+                if (!VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &old)) { dbg("VirtualProtect failed", modname, fn); break; }
+                iat->u1.Function = (ULONGLONG)(ULONG_PTR)PATCHES[i].repl;
+                VirtualProtect(&iat->u1.Function, sizeof(void *), old, &old);
+                dbg("patched import", modname, fn);
+                break;
+            }
+        }
+    }
+}
+
+/* Loader notification (ntdll.LdrRegisterDllNotification; Wine implements it). */
+typedef struct {
+    ULONG Flags;
+    const UNICODE_STRING *FullDllName;
+    const UNICODE_STRING *BaseDllName;
+    void *DllBase;
+    ULONG SizeOfImage;
+} LDR_NOTIFY_DATA;
+typedef void (CALLBACK *LDR_NOTIFY_FN)(ULONG reason, const LDR_NOTIFY_DATA *data, void *ctx);
+typedef LONG (NTAPI *pLdrRegisterDllNotification)(ULONG flags, LDR_NOTIFY_FN fn, void *ctx, void **cookie);
+
+static void CALLBACK on_dll_notify(ULONG reason, const LDR_NOTIFY_DATA *data, void *ctx)
+{
+    (void)ctx;
+    if (reason != 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */ || !data || !data->DllBase) return;
+    char name[128] = "?";
+    if (data->BaseDllName && data->BaseDllName->Buffer)
+        WideCharToMultiByte(CP_ACP, 0, data->BaseDllName->Buffer, data->BaseDllName->Length / 2, name, sizeof(name) - 1, NULL, NULL);
+    patch_module((HMODULE)data->DllBase, name);
+}
+
+typedef BOOL (WINAPI *pEnumProcessModules)(HANDLE, HMODULE *, DWORD, DWORD *);
+typedef DWORD (WINAPI *pGetModuleBaseNameA)(HANDLE, HMODULE, LPSTR, DWORD);
+
+static void patch_loaded_modules(void)
+{
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    pEnumProcessModules enumMods = (pEnumProcessModules)GetProcAddress(k32, "K32EnumProcessModules");
+    pGetModuleBaseNameA baseName = (pGetModuleBaseNameA)GetProcAddress(k32, "K32GetModuleBaseNameA");
+    if (!enumMods || !baseName) return;
+    HMODULE mods[1024];
+    DWORD needed = 0;
+    if (!enumMods(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
+    DWORD n = needed / sizeof(HMODULE);
+    if (n > 1024) n = 1024;
+    for (DWORD i = 0; i < n; i++) {
+        char name[128] = "?";
+        baseName(GetCurrentProcess(), mods[i], name, sizeof(name));
+        patch_module(mods[i], name);
+    }
+}
+
+static void *notify_cookie;
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
-        for (size_t i = 0; i < sizeof(PATCHES) / sizeof(PATCHES[0]); i++) apply(&PATCHES[i]);
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        pLdrRegisterDllNotification reg = ntdll ? (pLdrRegisterDllNotification)GetProcAddress(ntdll, "LdrRegisterDllNotification") : NULL;
+        if (reg) reg(0, on_dll_notify, NULL, &notify_cookie);
+        else OutputDebugStringA("ms365 ole32 shim: LdrRegisterDllNotification unavailable");
+        patch_loaded_modules();
     }
     return TRUE;
 }
