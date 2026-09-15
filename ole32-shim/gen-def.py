@@ -20,14 +20,12 @@ for e in p.DIRECTORY_ENTRY_EXPORT.symbols:
     else:
         lines.append(f"  {n} = ole32_wine.{n}")
 
-# Entry points Office asks ole32 for that this Wine build's ole32 does not export yet
-# (upstream Wine forwards them to combase; combase in these builds already implements them).
-EXTRA = {
-    "CoRegisterActivationFilter": "combase.CoRegisterActivationFilter",
-}
-for n, target in EXTRA.items():
+# Entry points Office asks ole32 for that this Wine build's ole32 does not export (and whose combase
+# counterpart is only a stub that aborts when called). These are implemented in shim.c.
+EXTRA = ["CoRegisterActivationFilter"]
+for n in EXTRA:
     if n not in names:
-        lines.append(f"  {n} = {target}")
+        lines.append(f"  {n}")
 
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"{len(lines)-2} exports written to {out}")

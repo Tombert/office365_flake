@@ -14,8 +14,7 @@ in stdenvNoCC.mkDerivation {
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
     export ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-local
     python3 gen-def.py ${runner}/files/lib/wine/x86_64-windows/ole32.dll ole32.def
-    printf 'int __ms365_ole32_shim;\n' > shim.c
-    zig cc -target x86_64-windows-gnu -shared -O2 -o ole32.dll shim.c ole32.def
+    zig cc -target x86_64-windows-gnu -shared -O2 -Wall -o ole32.dll shim.c ole32.def
     runHook postBuild
   '';
   installPhase = ''
