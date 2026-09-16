@@ -95,6 +95,27 @@ lists every unresolved import ("No implementation for ..."), which is how the ke
 found. Office's own logs land in `drive_c/users/steamuser/AppData/Local/Temp` (`PUTER-*.log` for
 Click-to-Run, `Diagnostics/<APP>/` for the apps).
 
+## Licensing and sign-in (where it stands)
+
+Office licenses itself through the Windows Software Protection Platform (SPP), which Wine does not
+have. The `sppc/` shim is a minimal stand-in: it stores the licence files the installer hands it,
+serves the SKU policies from them, and lets the out-of-box 5-day Grace licence run with a persisted
+timer, which is what a fresh Windows install does before activation. Nothing is reported as
+activated and no product keys are installed. It also answers Office's SPP authentication handshake
+by echoing the challenge, which is enough for Office to proceed to its own activation flow.
+
+With Shared Computer Activation enabled (`MS365_SCA`, on by default) Office licenses through a
+signed-in account token instead of SPP activation, and Word starts as "Unlicensed Product" with the
+"Sign in to set up Office" wizard. Sign in reaches the real Microsoft login page (OneAuth on, both
+Web Account Manager paths off in `Common\Identity`). What has not worked: signing in with a personal
+Microsoft account (Gmail-style MSA). After home-realm discovery OneAuth insists on the Windows Web
+Account Manager for MSA, a WinRT service Wine lacks, and fails with 0x80040154. A work or school
+(Entra ID) account takes the browser path and is the one to try; it is also the kind of account
+Shared Computer Activation is designed for.
+
+Extras that are in the prefix but not in the flake recipe: the Edge WebView2 runtime
+(`ms365 winetricks webview2`, 680 MB), installed while chasing this; unclear whether it matters.
+
 ## Expectations
 
 This is the college try, not a guarantee. Things that historically break: Microsoft account sign-in
