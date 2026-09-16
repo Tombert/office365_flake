@@ -663,7 +663,8 @@ API SLGetLicensingStatusInformation(HSLC h, const SLID *app, const SLID *sku, PC
             arr[i].dwTotalGraceDays = L ? L->grace_days : 0;
             arr[i].qwValidityExpiration = 0;
             DWORD rem = (L && is_grace_family(L)) ? grace_remaining_minutes(&skus[i], L->grace_days, 0) : 0;
-            if (rem) { arr[i].eStatus = SL_LICENSING_STATUS_IN_GRACE_PERIOD; arr[i].dwGraceTime = rem; arr[i].hrReason = S_OK; }
+            /* status reason for a grace-period product is SL_E_GRACE_PERIOD-style "running within the valid grace period" */
+            if (rem) { arr[i].eStatus = SL_LICENSING_STATUS_IN_GRACE_PERIOD; arr[i].dwGraceTime = rem; arr[i].hrReason = (HRESULT)0xC004F00C; }
             else if (L && is_grace_family(L)) { arr[i].eStatus = SL_LICENSING_STATUS_NOTIFICATION; arr[i].dwGraceTime = 0; arr[i].hrReason = 0xC004F009; /* grace expired */ }
             else { arr[i].eStatus = SL_LICENSING_STATUS_UNLICENSED; arr[i].dwGraceTime = 0; arr[i].hrReason = SL_E_PKEY_NOT_INSTALLED; }
         }
