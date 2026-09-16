@@ -66,6 +66,35 @@ MS365_RUNNER=protosoda MS365_EXCLUDE="Teams OneDrive Lync Bing Groove Outlook On
 * `ms365 reset --yes` deletes the prefix but keeps the downloaded Office payload.
 * If a run wedges, `ms365 kill`.
 
+## What it took (and where it stands)
+
+Status as of 2026-09-15 with GE-Proton 11-6 and Microsoft 365 Apps build 16.0.20326.20144:
+
+* The Office Deployment Tool downloads and installs the full suite inside the prefix.
+* Word starts (with `/q`, no splash screen), draws its start screen and ribbon, and shows the
+  Sign in button. On first start it also raises a "Microsoft Office cannot verify the license"
+  dialog because the licensing shim below reports no licences. Sign-in / activation has not been
+  verified yet.
+* Excel, PowerPoint, Outlook and the rest are installed but untested.
+
+Fixes the flake applies automatically, each one found by reading the Wine and Click-to-Run logs:
+
+| Problem | Fix |
+|---|---|
+| Installer error 0-2031 (17002): integrator aborts in `sppc.dll.SLInstallLicense`, a Wine stub | `sppc/`: replacement Software Protection Platform client DLL that accepts licence installs and reports nothing installed |
+| Installer crash in the LastRun task: Wine's WinRT `PackageManager` returns `E_NOINTERFACE` for a newer interface and Office dereferences NULL | `appxdeploymentclient` DLL override disabled; Office logs the failure and continues |
+| Word: `CoRegisterActivationFilter` missing from ole32 (mso30win32client dereferences NULL) | `ole32-shim/`: forwarder `ole32.dll` that re-exports the builtin (kept as `ole32_wine.dll`) and implements the function |
+| Word: `SetFileShortNameW`, `FindPackagesByPackageFamily`, `SetThreadpoolTimerEx` not exported by Wine's kernel32; the loader binds them to aborting stubs | the ole32 shim registers a loader notification and rewrites those import slots in every module with benign replacements |
+| Word: special user APCs (`QueueUserAPC2`) dispatched wrongly by this Wine, Office aborts | the shim hides `QueueUserAPC2` from `GetProcAddress`; Office uses its pre-20H1 path |
+| Word: splash-screen thread crashes in combase during COM apartment teardown, Office's crash handler kills the app | Word is launched with `/q` |
+| `mso.dll` and friends live in Office's VFS tree; the App-V redirection layer is unreliable under Wine | the VFS tree is mirrored into `Program Files` with symlinks |
+| Office offers safe mode after every crash via a modal prompt | the launcher clears the Resiliency key before starting an app |
+
+Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
+lists every unresolved import ("No implementation for ..."), which is how the kernel32 gaps were
+found. Office's own logs land in `drive_c/users/steamuser/AppData/Local/Temp` (`PUTER-*.log` for
+Click-to-Run, `Diagnostics/<APP>/` for the apps).
+
 ## Expectations
 
 This is the college try, not a guarantee. Things that historically break: Microsoft account sign-in
