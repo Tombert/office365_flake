@@ -83,6 +83,86 @@ static HRESULT WINAPI my_CreateStdAccessibleProxyA(HWND hwnd, LPCSTR cls, LONG i
 
 struct patch { const char *dll; const char *fn; void *repl; };
 
+/* ---- replacements for functions Office delay-loads that Wine's DLLs do not export ----------
+ * Delay-loads go through GetProcAddress at first call; a NULL result makes Office's delay-load
+ * helper raise 0xC06D007F and the app dies. GetProcAddress is hooked (see my_GetProcAddress) to
+ * fall back to these when the real lookup fails. */
+
+/* user32: place a popup of `size` at `anchor`, kept inside the monitor's work area. */
+static BOOL WINAPI my_CalculatePopupWindowPosition(const POINT *anchor, const SIZE *size, UINT flags, RECT *exclude, RECT *pos)
+{
+    (void)flags; (void)exclude;
+    if (!anchor || !size || !pos) return FALSE;
+    MONITORINFO mi; mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromPoint(*anchor, MONITOR_DEFAULTTONEAREST);
+    RECT work = { 0, 0, 1920, 1080 };
+    if (mon && GetMonitorInfoW(mon, &mi)) work = mi.rcWork;
+    LONG x = anchor->x, y = anchor->y;
+    if (x + size->cx > work.right) x = work.right - size->cx;
+    if (y + size->cy > work.bottom) y = work.bottom - size->cy;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+    pos->left = x; pos->top = y; pos->right = x + size->cx; pos->bottom = y + size->cy;
+    return TRUE;
+}
+static BOOL WINAPI my_InheritWindowMonitor(HWND hwnd, HWND inherit) { (void)hwnd; (void)inherit; return TRUE; }
+
+/* slc.dll: forward to our sppc.dll */
+static HRESULT WINAPI my_SLGetGenuineInformation(const void *id, LPCWSTR name, int *type, UINT *size, BYTE **data)
+{
+    typedef HRESULT (WINAPI *fn_t)(const void *, LPCWSTR, int *, UINT *, BYTE **);
+    HMODULE m = LoadLibraryA("sppc.dll");
+    fn_t fn = m ? (fn_t)GetProcAddress(m, "SLGetGenuineInformation") : NULL;
+    if (!fn) { if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return (HRESULT)0xC004F012; }
+    return fn(id, name, type, size, data);
+}
+
+/* misc: report "not supported" the way the real API does when the feature is absent */
+static HRESULT WINAPI my_DeleteAppContainerProfile(LPCWSTR name) { (void)name; return S_OK; }
+static DWORD WINAPI my_DavFlushFile(HANDLE h) { (void)h; return ERROR_NOT_SUPPORTED; }
+static DWORD WINAPI my_DavGetExtendedError(HANDLE h, DWORD *err, LPWSTR buf, DWORD *len) { (void)h; if (err) *err = 0; if (buf && len && *len) buf[0] = 0; if (len) *len = 0; return ERROR_NOT_SUPPORTED; }
+static BOOL WINAPI my_CertSelectCertificateChains(void *a, void *b, void *c, void *d, void *e, DWORD *count, void **chains)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; if (count) *count = 0; if (chains) *chains = NULL; SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+static void WINAPI my_CertFreeCertificateChainList(void *chains) { (void)chains; }
+static BOOL WINAPI my_CryptRetrieveTimeStamp(void) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+static BOOL WINAPI my_CryptVerifyTimeStampSignature(void) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+static HRESULT WINAPI my_CertSelectionGetSerializedBlob(void) { return E_NOTIMPL; }
+
+static const struct patch DELAYPATCHES[] = {
+    { "user32.dll",   "CalculatePopupWindowPosition",  (void *)my_CalculatePopupWindowPosition },
+    { "user32.dll",   "InheritWindowMonitor",          (void *)my_InheritWindowMonitor },
+    { "slc.dll",      "SLGetGenuineInformation",       (void *)my_SLGetGenuineInformation },
+    { "userenv.dll",  "DeleteAppContainerProfile",     (void *)my_DeleteAppContainerProfile },
+    { "netapi32.dll", "DavFlushFile",                  (void *)my_DavFlushFile },
+    { "netapi32.dll", "DavGetExtendedError",           (void *)my_DavGetExtendedError },
+    { "crypt32.dll",  "CertSelectCertificateChains",   (void *)my_CertSelectCertificateChains },
+    { "crypt32.dll",  "CertFreeCertificateChainList",  (void *)my_CertFreeCertificateChainList },
+    { "crypt32.dll",  "CryptRetrieveTimeStamp",        (void *)my_CryptRetrieveTimeStamp },
+    { "crypt32.dll",  "CryptVerifyTimeStampSignature", (void *)my_CryptVerifyTimeStampSignature },
+    { "cryptui.dll",  "CertSelectionGetSerializedBlob",(void *)my_CertSelectionGetSerializedBlob },
+};
+#define NDELAYPATCHES (sizeof(DELAYPATCHES) / sizeof(DELAYPATCHES[0]))
+
+typedef FARPROC (WINAPI *pGetProcAddress)(HMODULE, LPCSTR);
+static pGetProcAddress real_GetProcAddress;
+typedef DWORD (WINAPI *pGetModuleBaseNameA_t)(HANDLE, HMODULE, LPSTR, DWORD);
+static pGetModuleBaseNameA_t real_GetModuleBaseNameA;
+
+static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
+{
+    FARPROC p = real_GetProcAddress(h, name);
+    if (p || !name || ((ULONG_PTR)name >> 16) == 0) return p;   /* ordinal lookups pass through */
+    char mod[128] = "";
+    if (real_GetModuleBaseNameA) real_GetModuleBaseNameA(GetCurrentProcess(), h, mod, sizeof(mod));
+    for (size_t i = 0; i < NDELAYPATCHES; i++) {
+        if (lstrcmpiA(mod, DELAYPATCHES[i].dll) == 0 && strcmp(name, DELAYPATCHES[i].fn) == 0) {
+            char buf[256]; wsprintfA(buf, "ms365 ole32 shim: GetProcAddress fallback %s!%s", mod, name); OutputDebugStringA(buf);
+            return (FARPROC)DELAYPATCHES[i].repl;
+        }
+    }
+    return NULL;
+}
+
 /* Exported stubs to overwrite in place (12-byte "mov rax, imm64; jmp rax") when their DLL loads.
  * Unlike PATCHES these exist in the export table, but calling them aborts the process. */
 static const struct patch STUBPATCHES[] = {
@@ -92,6 +172,7 @@ static const struct patch STUBPATCHES[] = {
 #define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
 
 static const struct patch PATCHES[] = {
+    { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
@@ -279,6 +360,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
+        /* capture the genuine entry points before any import slot is rewritten */
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        real_GetProcAddress = (pGetProcAddress)GetProcAddress(k32, "GetProcAddress");
+        real_GetModuleBaseNameA = (pGetModuleBaseNameA_t)GetProcAddress(k32, "K32GetModuleBaseNameA");
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         pLdrRegisterDllNotification reg = ntdll ? (pLdrRegisterDllNotification)GetProcAddress(ntdll, "LdrRegisterDllNotification") : NULL;
         if (reg) reg(0, on_dll_notify, NULL, &notify_cookie);
