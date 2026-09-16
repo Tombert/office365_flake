@@ -509,18 +509,47 @@ static INSTALLSTATE WINAPI my_MsiGetComponentPathW(LPCWSTR product, LPCWSTR comp
  * into an independent xdg toplevel, which tiling compositors (sway) then tile: the layout reshuffles,
  * Word's document swapchain loses its surface, and everything flickers until the strip goes away.
  * Give those strips an owner (the active window, i.e. the one being decorated), which makes them
- * transient windows: positioned relative to the owner and floated by the compositor. */
+ * transient windows: positioned relative to the owner and floated by the compositor. Only on the
+ * Wayland driver: on X11 the owner change makes Office raise its fatal assertion (0xe0000002) a
+ * second later, and X11 has no need for it. MS365_OWN_BORDERS=0/1 overrides. */
 typedef HWND (WINAPI *pCreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-static pCreateWindowExW real_CreateWindowExW; static LONG g_border_logs;
+static pCreateWindowExW real_CreateWindowExW; static LONG g_border_logs; static int g_own_borders = -1;
+static int own_borders(void)
+{
+    if (g_own_borders < 0) {
+        char v[32] = "";
+        if (GetEnvironmentVariableA("MS365_OWN_BORDERS", v, sizeof(v))) g_own_borders = v[0] == '1';
+        else g_own_borders = GetEnvironmentVariableA("WINE_GRAPHICS_DRIVER", v, sizeof(v)) && lstrcmpiA(v, "wayland") == 0;
+    }
+    return g_own_borders;
+}
+/* The window being decorated: the active window if there is one, otherwise the thread's main
+ * visible top-level window (under Wayland nothing is active until the compositor hands focus over,
+ * and Office creates the strips before that). */
+static BOOL CALLBACK find_main_window(HWND hwnd, LPARAM lp)
+{
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE), ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if ((style & WS_VISIBLE) && !(style & WS_CHILD) && !(ex & WS_EX_TOOLWINDOW) && (style & WS_CAPTION) == WS_CAPTION) {
+        *(HWND *)lp = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+static HWND decorated_window(HWND self)
+{
+    HWND owner = GetActiveWindow();
+    if (!owner || owner == self) owner = GetForegroundWindow();
+    if (!owner || owner == self) { owner = NULL; EnumThreadWindows(GetCurrentThreadId(), find_main_window, (LPARAM)&owner); }
+    return owner != self ? owner : NULL;
+}
 static HWND WINAPI my_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
 {
     HWND hwnd = real_CreateWindowExW(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
-    if (hwnd && !parent && (style & WS_POPUP) && (ex & WS_EX_LAYERED)) {
+    if (hwnd && !parent && (style & WS_POPUP) && (ex & WS_EX_LAYERED) && own_borders()) {
         WCHAR cn[64];
         if (GetClassNameW(hwnd, cn, 64) && lstrcmpiW(cn, L"MSO_BORDEREFFECT_WINDOW_CLASS") == 0) {
-            HWND owner = GetActiveWindow();
-            if (!owner) owner = GetForegroundWindow();
-            if (owner && owner != hwnd) {
+            HWND owner = decorated_window(hwnd);
+            if (owner) {
                 SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)owner);
                 if (InterlockedIncrement(&g_border_logs) <= 20) {
                     char msg[160]; wsprintfA(msg, "ms365 ole32 shim: border-effect window %p owned by %p", hwnd, owner); OutputDebugStringA(msg);
@@ -810,11 +839,26 @@ static void patch_loaded_modules(void)
 
 static void *notify_cookie;
 
+/* The same DLL is loaded twice: as ole32.dll (the forwarder, whenever Office first calls ole32)
+ * and as ms365shim.dll through AppInit_DLLs, so that processes that never touch ole32 (Excel)
+ * still get the shim. Whichever instance comes first does the patching; the other stays passive. */
+__declspec(dllexport) int ms365_shim_present = 1;
+static BOOL other_instance_active(HINSTANCE inst)
+{
+    char path[MAX_PATH]; const char *base;
+    if (!GetModuleFileNameA(inst, path, sizeof(path))) return FALSE;
+    base = strrchr(path, '\\'); base = base ? base + 1 : path;
+    const char *other = lstrcmpiA(base, "ms365shim.dll") == 0 ? "ole32.dll" : "ms365shim.dll";
+    HMODULE h = GetModuleHandleA(other);
+    return h && h != inst && GetProcAddress(h, "ms365_shim_present") != NULL;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
+        if (other_instance_active(inst)) { OutputDebugStringA("ms365 ole32 shim: second instance, passive"); return TRUE; }
         /* capture the genuine entry points before any import slot is rewritten */
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         real_GetProcAddress = (pGetProcAddress)GetProcAddress(k32, "GetProcAddress");

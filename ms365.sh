@@ -163,7 +163,7 @@ apply_dpi() {
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
 REGISTRY_REV=5
-SHIMS_REV=sppc,ole32,uia,d2d1   # bump when install_shims gains a DLL or an override
+SHIMS_REV=sppc,ole32,uia,d2d1,appinit   # bump when install_shims gains a DLL or an override
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
@@ -306,6 +306,9 @@ install_shims() {
   put_dll "$(ole32_shim_for_runner)" ole32.dll
   put_dll "$MS365_UIA_SHIM" ms365uia.dll
   put_dll "$MS365_D2D1_DLL" d2d1.dll
+  # the same shim once more under its own name, loaded into every process through AppInit_DLLs:
+  # Excel never delay-loads ole32, so the ole32 forwarder alone would leave it without the shim
+  put_dll "$(ole32_shim_for_runner)" ms365shim.dll
   local reg="$ODT_DIR/shim-overrides.reg"
   mkdir -p "$ODT_DIR"
   cat > "$reg" <<'REG'
@@ -317,6 +320,12 @@ Windows Registry Editor Version 5.00
 ; d2d1-fix/: Direct2D from a newer Wine. Wine 11.0's d2d1 fills geometry groups without their fill
 ; mode, which turns the ribbon controls' border rings into solid blocks that hide the text.
 "d2d1"="native"
+
+; Load the shim into every process (Excel never touches ole32); the shim's DllMain keeps whichever
+; instance loads second passive.
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Windows]
+"AppInit_DLLs"="ms365shim.dll"
+"LoadAppInit_DLLs"=dword:00000001
 
 ; CLSID_CUIAutomationRegistrar: Wine's uiautomationcore has no class object for it and Office
 ; dereferences the NULL result as soon as a document gets focus. ms365uia.dll (uia-shim/) provides it;
@@ -491,6 +500,7 @@ cmd_run() {
     put_dll "$(ole32_shim_for_runner)" ole32.dll
     put_dll "$MS365_UIA_SHIM" ms365uia.dll
     put_dll "$MS365_D2D1_DLL" d2d1.dll
+    put_dll "$(ole32_shim_for_runner)" ms365shim.dll
     # a prefix update rewrites Wine's own class registrations; put ours back when they are gone.
     # Also re-run when this version added a DLL override the prefix does not have yet.
     if ! grep -aqF 'ms365uia' "$root/system.reg" 2>/dev/null || [ "$(cat "$MS365_PREFIX/.ms365-shims" 2>/dev/null)" != "$SHIMS_REV" ]; then
