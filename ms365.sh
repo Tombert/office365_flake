@@ -134,16 +134,16 @@ apply_tricks() {
 }
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
-REGISTRY_REV=4
+REGISTRY_REV=5
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
   cat > "$reg" <<'REG'
 Windows Registry Editor Version 5.00
 
-; Force Direct2D 1.0 factory: Office's ribbon/text rendering trips on newer D2D/DWrite paths in Wine.
-[HKEY_CURRENT_USER\Software\Wine\Direct2D]
-"max_version_factory"=dword:00000000
+; No Direct2D factory version cap (older Office-on-Wine notes suggested one; with GE-Proton 11 Office's
+; request for the D2D 1.1 factory succeeds and the ribbon renders with it).
+[-HKEY_CURRENT_USER\Software\Wine\Direct2D]
 
 ; Office C2R checks for the SLC/SPP licensing platform; mark it present so the installer proceeds.
 [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform]
@@ -152,8 +152,11 @@ Windows Registry Editor Version 5.00
 ; Wine's WinRT PackageManager (appxdeploymentclient) is a stub that returns E_NOINTERFACE for the
 ; IPackageManager revision Office asks for, and OfficeClickToRun then dereferences NULL while staging
 ; MSIX add-ons in its LastRun task. With the library unavailable Office logs an error and moves on.
+; Wine's hvsimanagementapi (Windows Sandbox host) is a stub answering E_NOTIMPL; the Click-to-Run
+; client turns that into a fatal exception when it applies product changes. Absent, it is skipped.
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "appxdeploymentclient"=""
+"hvsimanagementapi"=""
 
 ; Verbose Windows Installer logs (MSI*.log in %TEMP%) so integrator MSI failures are diagnosable.
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Installer]
@@ -219,6 +222,12 @@ REG
 
 [HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Office\\ClickToRun\\Configuration]
 "SharedComputerLicensing"="$sca"
+
+; A personal subscription makes Click-to-Run try to switch the installed product to O365HomePremRetail;
+; that switch cannot complete under Wine (WinRT PackageManager) and leaves Office half-configured.
+; The ProPlus install licenses fine with the personal subscription, so block SKU-to-SKU switching.
+[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Office\\ClickToRun\\Updates]
+"UpdatesSkuToSkuBlocked"="1"
 
 [HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Common\\Licensing\\LicensingNext]
 "$MS365_PRODUCT"=dword:00000002
@@ -433,6 +442,12 @@ cmd_run() {
   fi
   # registry tweaks added after the prefix was installed
   if [ "$(cat "$MS365_PREFIX/.ms365-registry" 2>/dev/null)" != "$REGISTRY_REV" ]; then apply_registry; fi
+  # Office occasionally resets the product's vNext licensing flag (seen after a failed SKU switch);
+  # without it the legacy validation runs and Word starts unlicensed. Re-assert it when missing.
+  if ! grep -aqF "\"$MS365_PRODUCT\"=dword:00000002" "$root/user.reg" 2>/dev/null; then
+    log "restoring vNext licensing mode for $MS365_PRODUCT"
+    apply_registry
+  fi
   if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
