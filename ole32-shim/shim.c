@@ -171,8 +171,49 @@ static const struct patch STUBPATCHES[] = {
 };
 #define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
 
+/* ---- WinHTTP options Wine has not implemented -------------------------------------------
+ * Wine's winhttp fails WinHttpSetOption/WinHttpQueryOption with ERROR_WINHTTP_INVALID_OPTION
+ * (12009) for options it doesn't know, and Office's OneAuth treats that as a failed request
+ * (sign-in dies right after the password step with code 12009). The options it uses are tuning
+ * knobs: IPv6 fast fallback (140) and the autologon policy query (77), for which the default
+ * security level is the right answer. */
+#define MY_WINHTTP_OPTION_AUTOLOGON_POLICY     77
+#define MY_WINHTTP_OPTION_IPV6_FAST_FALLBACK   140
+#define MY_ERROR_WINHTTP_INVALID_OPTION        12009
+typedef BOOL (WINAPI *pWinHttpSetOption)(HANDLE, DWORD, LPVOID, DWORD);
+typedef BOOL (WINAPI *pWinHttpQueryOption)(HANDLE, DWORD, LPVOID, LPDWORD);
+static BOOL WINAPI my_WinHttpSetOption(HANDLE h, DWORD option, LPVOID buf, DWORD len)
+{
+    HMODULE m = GetModuleHandleA("winhttp.dll");
+    pWinHttpSetOption fn = m ? (pWinHttpSetOption)real_GetProcAddress(m, "WinHttpSetOption") : NULL;
+    if (fn && fn(h, option, buf, len)) return TRUE;
+    DWORD err = GetLastError();
+    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option >= 128) { SetLastError(0); return TRUE; } /* newer tuning options: accept */
+    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY) { SetLastError(0); return TRUE; }
+    SetLastError(err);
+    return FALSE;
+}
+static BOOL WINAPI my_WinHttpQueryOption(HANDLE h, DWORD option, LPVOID buf, LPDWORD len)
+{
+    HMODULE m = GetModuleHandleA("winhttp.dll");
+    pWinHttpQueryOption fn = m ? (pWinHttpQueryOption)real_GetProcAddress(m, "WinHttpQueryOption") : NULL;
+    if (fn && fn(h, option, buf, len)) return TRUE;
+    DWORD err = GetLastError();
+    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY && len) {
+        if (!buf || *len < sizeof(DWORD)) { *len = sizeof(DWORD); SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        *(DWORD *)buf = 1; /* WINHTTP_AUTOLOGON_SECURITY_LEVEL_MEDIUM, the Windows default */
+        *len = sizeof(DWORD);
+        SetLastError(0);
+        return TRUE;
+    }
+    SetLastError(err);
+    return FALSE;
+}
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
+    { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
+    { "winhttp.dll",  "WinHttpQueryOption",          (void *)my_WinHttpQueryOption },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
