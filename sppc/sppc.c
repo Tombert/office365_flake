@@ -706,8 +706,38 @@ API SLGetPKeyId(HSLC h, PCWSTR alg, PCWSTR key, UINT cb, const BYTE *data, SLID 
 { (void)h; (void)alg; (void)cb; (void)data; if (pkey_id) memset(pkey_id, 0, sizeof(*pkey_id)); TRACE_RET("SLGetPKeyId", NULL, NULL, key, SL_E_VALUE_NOT_FOUND); }
 API SLGetEncryptedPIDEx(HSLC h, const SLID *sku, UINT *size, PBYTE *data)
 { (void)h; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetEncryptedPIDEx", sku, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
+/* Authentication data: Office hands SPP a blob before consuming rights; the SPP plug-in evaluates the
+ * licence's external validator against it and Office reads the outcome back with
+ * SLGetAuthenticationResult. Kept per process; dumped to the trace so the format can be studied. */
+static BYTE auth_data[1024]; static UINT auth_len;
+API SLSetAuthenticationData(HSLC h, UINT cb, const BYTE *pb)
+{
+    (void)h;
+    if (pb && cb && cb <= sizeof(auth_data)) { memcpy(auth_data, pb, cb); auth_len = cb; }
+    char hex[3 * 64 + 8]; UINT n = cb < 64 ? cb : 64; hex[0] = 0;
+    for (UINT i = 0; pb && i < n; i++) wsprintfA(hex + 3 * i, "%02x ", pb[i]);
+    tracef("sppc shim: SLSetAuthenticationData %u bytes: %s", cb, hex);
+    if (pb && cb > 64) {
+        for (UINT off = 64; off < cb; off += 64) {
+            UINT m = (cb - off) < 64 ? (cb - off) : 64; hex[0] = 0;
+            for (UINT i = 0; i < m; i++) wsprintfA(hex + 3 * i, "%02x ", pb[off + i]);
+            tracef("sppc shim:   +%03x: %s", off, hex);
+        }
+    }
+    return S_OK;
+}
 API SLGetAuthenticationResult(HSLC h, UINT *size, PBYTE *data)
-{ (void)h; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetAuthenticationResult", NULL, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
+{
+    (void)h;
+    HRESULT hr = SL_E_VALUE_NOT_FOUND;
+    if (size) *size = 0; if (data) *data = NULL;
+    if (auth_len) {
+        /* experiment: hand the authentication data back as the result */
+        BYTE *out = (BYTE *)LocalAlloc(LMEM_FIXED, auth_len);
+        if (out) { memcpy(out, auth_data, auth_len); if (size) *size = auth_len; if (data) *data = out; else LocalFree(out); hr = S_OK; }
+    }
+    TRACE_RET("SLGetAuthenticationResult", NULL, NULL, NULL, hr);
+}
 API SLGenerateOfflineInstallationId(HSLC h, const SLID *sku, PWSTR *out)
 { (void)h; if (out) *out = NULL; TRACE_RET("SLGenerateOfflineInstallationId", sku, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
 API SLGenerateOfflineInstallationIdEx(HSLC h, const SLID *sku, const void *info, PWSTR *out)
@@ -753,7 +783,6 @@ API SLRegisterPlugin(void *a, void *b, void *c, void *d)
     }
     return S_OK;
 }
-OK_STUB(SLSetAuthenticationData)
 OK_STUB(SLSetGenuineInformation)
 OK_STUB(SLUnregisterPlugin)
 OK_STUB(SLpAuthenticateGenuineTicketResponse)
