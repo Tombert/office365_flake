@@ -158,9 +158,22 @@ static pGetModuleBaseNameA_t real_GetModuleBaseNameA;
 
 static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name);
 static const struct patch *wrapped_lookup_ordinal(HMODULE h, WORD ordinal);
+/* MS365_TRACE_MODULE=<dll>: log every export lookup into that module and every failed lookup
+ * anywhere (diagnostics for probes such as Office loading a proofing engine and dropping it). */
+static HMODULE g_trace_mod; static char g_trace_mod_name[64]; static LONG g_gpa_logs;
+static void gpa_log(HMODULE h, LPCSTR name, FARPROC p)
+{
+    char buf[300], mod[128] = "?";
+    if (InterlockedIncrement(&g_gpa_logs) > 400) return;
+    if (real_GetModuleBaseNameA) real_GetModuleBaseNameA(GetCurrentProcess(), h, mod, sizeof(mod));
+    if (((ULONG_PTR)name >> 16) != 0) wsprintfA(buf, "ms365 ole32 shim: GetProcAddress %s!%s -> %p", mod, name, p);
+    else wsprintfA(buf, "ms365 ole32 shim: GetProcAddress %s!#%u -> %p", mod, (UINT)(ULONG_PTR)name, p);
+    OutputDebugStringA(buf);
+}
 static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
 {
     FARPROC p = real_GetProcAddress(h, name);
+    if (g_trace_mod_name[0] && name && (h == g_trace_mod || !p)) gpa_log(h, name, p);
     if (name && ((ULONG_PTR)name >> 16) != 0) {
         /* functions we wrap (see PATCHES) must be wrapped for dynamic lookups too */
         const struct patch *w = p ? wrapped_lookup(h, name) : NULL;
@@ -847,6 +860,7 @@ static void CALLBACK on_dll_notify(ULONG reason, const LDR_NOTIFY_DATA *data, vo
     char name[128] = "?";
     if (data->BaseDllName && data->BaseDllName->Buffer)
         WideCharToMultiByte(CP_ACP, 0, data->BaseDllName->Buffer, data->BaseDllName->Length / 2, name, sizeof(name) - 1, NULL, NULL);
+    if (g_trace_mod_name[0] && lstrcmpiA(name, g_trace_mod_name) == 0) g_trace_mod = (HMODULE)data->DllBase;
     note_module((HMODULE)data->DllBase, name);
     patch_module((HMODULE)data->DllBase, name);
     patch_stubs((HMODULE)data->DllBase, name);
@@ -887,6 +901,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         real_GetProcAddress = (pGetProcAddress)GetProcAddress(k32, "GetProcAddress");
         real_GetModuleBaseNameA = (pGetModuleBaseNameA_t)GetProcAddress(k32, "K32GetModuleBaseNameA");
         { char v[8]; if (GetEnvironmentVariableA("MS365_D2D_SYNC", v, sizeof(v)) && v[0] == '0') g_d2d_sync = 0; }
+        GetEnvironmentVariableA("MS365_TRACE_MODULE", g_trace_mod_name, sizeof(g_trace_mod_name));
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         pLdrRegisterDllNotification reg = ntdll ? (pLdrRegisterDllNotification)GetProcAddress(ntdll, "LdrRegisterDllNotification") : NULL;
         if (reg) reg(0, on_dll_notify, NULL, &notify_cookie);

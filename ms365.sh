@@ -355,7 +355,7 @@ register_msi_components() {
   umu regedit /S "$reg"
   printf '%s' "$MSI_COMPONENTS_REV" > "$MS365_PREFIX/.ms365-msi-components"
 }
-MSI_COMPONENTS_REV=3   # 3: products + features registration, explicit qualified-component ids
+MSI_COMPONENTS_REV=4   # 4: "<lang>\Normal" category = the spelling lexicon
 
 post_install_fixups() {
   mirror_vfs

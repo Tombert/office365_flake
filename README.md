@@ -52,6 +52,7 @@ All optional, all environment variables:
 | `MS365_SCA` | `0` | `1` switches to Shared Computer Activation (business subscriptions only) instead of vNext token licensing |
 | `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
 | `MS365_D2D_SYNC` | `1` | `0` turns off the ole32 shim's GPU wait after every Direct2D `EndDraw` (see the ribbon row below) |
+| `MS365_TRACE_MODULE` | unset | debugging: the shim logs every export lookup into this DLL and every failed lookup (`MS365_DEBUG=1` to see them) |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -96,7 +97,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
 | Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | Wine 11.0's `d2d1` ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. The shim's `EndDraw` GPU wait (`MS365_D2D_SYNC`) predates this finding and is kept as a safety net |
-| "Missing proofing tools" banner although the dictionaries are installed | Office finds proofing engines through MSI component registrations the Click-to-Run integrator never wrote under Wine; `msi-components.py` rebuilds them from the package manifests |
+| "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
 lists every unresolved import ("No implementation for ..."), which is how the kernel32 gaps were
@@ -142,9 +143,11 @@ on Wine's `JsonValue`).
 
 ## Known problems
 
-* **Proofing engine**: the "missing proofing tools" banner is gone (the MSI component registrations
-  are in place and the speller host loads), but the English speller engine itself is not picked up
-  yet, so spell checking stays off. Next on the list.
+* **Proofing categories are mapped by file role.** The Click-to-Run manifests list which qualified
+  component categories a language package publishes but not which file each one stands for;
+  `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to
+  MSGR*.LEX, hyphenation and thesaurus split between engine DLL and lexicon). Spelling works; if
+  hyphenation or the thesaurus (Shift+F7) refuse a language, those two mappings are the suspects.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
   GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the

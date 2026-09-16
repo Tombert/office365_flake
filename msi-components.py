@@ -118,7 +118,7 @@ ROLE = {
     "{539009AB-E05A-41F3-B6A5-0D0A68AF8B24}": r"NL7MODELS\w*\.DLL$", # ProofModelFile
     "{509B6F9B-C120-4FFC-86A1-012E20A9D3BE}": r"MSCSS7[A-Z]{2}\.DLL$",  # nlg_CSS (contextual speller)
     "{B95B001F-4C25-4297-BCBF-1AE95C48D95E}": r"MSCSS7CM_\w*\.DUB$", # nlg_updates
-    "{EF8E9806-D488-4BE1-8D06-01B401C9DE98}": r"MSO\.ACL$",          # autocorrect list "<lang>\Normal"
+    "{EF8E9806-D488-4BE1-8D06-01B401C9DE98}": r"MSSP\d*\w*\.LEX$",   # "<lang>\Normal": the language's normal spelling dictionary
     "{99A98A3E-2336-44D4-B56A-099F5CE3AF98}": r"MSWDS_\w*\.LEX$",    # find all word forms
     "{7228F250-A792-4094-A843-2EAAB88516C8}": r"FILTER_PHRASE\.BIN$",
     "{48960E6E-4B74-4873-9503-2D76FECCAA90}": r"\\\.CONFIG$",
