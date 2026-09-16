@@ -16,6 +16,7 @@
  * WINEDEBUG=+module (MS365_DEBUG=+module) lists every unresolved import as "No implementation for".
  */
 #include <windows.h>
+typedef LPVOID HINTERNET;
 #include <winternl.h>
 #include <string.h>
 
@@ -222,10 +223,50 @@ static BOOL WINAPI my_WinHttpQueryOption(HANDLE h, DWORD option, LPVOID buf, LPD
     return FALSE;
 }
 
+/* ---- WinINet options Wine has not implemented -------------------------------------------
+ * Office's Microsoft-account ticket requests (the legacy MSA path, used once WAM and OneAuth are
+ * off) go through wininet. Wine's InternetSetOption rejects options it has not implemented with
+ * ERROR_INTERNET_INVALID_OPTION (12009, the same number as its winhttp cousin) and the request is
+ * abandoned with sign-in error tag 53u4r. The options seen are tuning knobs (11 = listen timeout),
+ * so unknown ones are accepted. Query failures are only traced. */
+typedef BOOL (WINAPI *pInternetSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
+typedef BOOL (WINAPI *pInternetQueryOption)(HINTERNET, DWORD, LPVOID, LPDWORD);
+static pInternetSetOption real_InternetSetOptionW, real_InternetSetOptionA;
+static pInternetQueryOption real_InternetQueryOptionW, real_InternetQueryOptionA;
+static BOOL inet_set_option(pInternetSetOption fn, const char *who, HINTERNET h, DWORD option, LPVOID buf, DWORD len)
+{
+    if (fn && fn(h, option, buf, len)) return TRUE;
+    DWORD err = GetLastError();
+    if (err == MY_ERROR_WINHTTP_INVALID_OPTION) {
+        char b[96]; wsprintfA(b, "ms365 ole32 shim: %s %lu accepted (unimplemented in Wine)", who, option); OutputDebugStringA(b);
+        SetLastError(0); return TRUE;
+    }
+    SetLastError(err);
+    return FALSE;
+}
+static BOOL inet_query_option(pInternetQueryOption fn, const char *who, HINTERNET h, DWORD option, LPVOID buf, LPDWORD len)
+{
+    if (fn && fn(h, option, buf, len)) return TRUE;
+    DWORD err = GetLastError();
+    if (err == MY_ERROR_WINHTTP_INVALID_OPTION) {
+        char b[96]; wsprintfA(b, "ms365 ole32 shim: %s %lu failed (unimplemented in Wine)", who, option); OutputDebugStringA(b);
+    }
+    SetLastError(err);
+    return FALSE;
+}
+static BOOL WINAPI my_InternetSetOptionW(HINTERNET h, DWORD o, LPVOID b, DWORD l)     { return inet_set_option(real_InternetSetOptionW, "InternetSetOptionW", h, o, b, l); }
+static BOOL WINAPI my_InternetSetOptionA(HINTERNET h, DWORD o, LPVOID b, DWORD l)     { return inet_set_option(real_InternetSetOptionA, "InternetSetOptionA", h, o, b, l); }
+static BOOL WINAPI my_InternetQueryOptionW(HINTERNET h, DWORD o, LPVOID b, LPDWORD l) { return inet_query_option(real_InternetQueryOptionW, "InternetQueryOptionW", h, o, b, l); }
+static BOOL WINAPI my_InternetQueryOptionA(HINTERNET h, DWORD o, LPVOID b, LPDWORD l) { return inet_query_option(real_InternetQueryOptionA, "InternetQueryOptionA", h, o, b, l); }
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
     { "winhttp.dll",  "WinHttpQueryOption",          (void *)my_WinHttpQueryOption },
+    { "wininet.dll",  "InternetSetOptionW",          (void *)my_InternetSetOptionW },
+    { "wininet.dll",  "InternetSetOptionA",          (void *)my_InternetSetOptionA },
+    { "wininet.dll",  "InternetQueryOptionW",        (void *)my_InternetQueryOptionW },
+    { "wininet.dll",  "InternetQueryOptionA",        (void *)my_InternetQueryOptionA },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
@@ -236,13 +277,22 @@ static const struct patch PATCHES[] = {
 /* PATCHES entries that wrap an existing export (not GetProcAddress itself), keyed by module.
  * No API calls in here: Office's App-V layer (AppVIsvSubsystems64) detours kernel32 entry points
  * such as GetModuleHandleA and fails fast when they are re-entered from inside a GetProcAddress
- * that it is making itself. The winhttp handle is recorded by the loader notification instead. */
-static HMODULE g_winhttp;
+ * that it is making itself. Module handles are recorded by the loader notification instead. */
+static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
+    { "winhttp.dll", NULL },
+    { "wininet.dll", NULL },
+};
+#define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name)
 {
-    if (!g_winhttp || h != g_winhttp) return NULL;
-    for (size_t i = 0; i < NPATCHES; i++)
-        if (PATCHES[i].dll[0] == 'w' && lstrcmpiA(PATCHES[i].dll, "winhttp.dll") == 0 && strcmp(PATCHES[i].fn, name) == 0) return &PATCHES[i];
+    for (size_t m = 0; m < NWRAPMODS; m++) {
+        if (!WRAPMODS[m].h || WRAPMODS[m].h != h) continue;
+        for (size_t i = 0; i < NPATCHES; i++)
+            if (PATCHES[i].dll == WRAPMODS[m].dll || (lstrcmpiA(PATCHES[i].dll, WRAPMODS[m].dll) == 0 && strcmp(PATCHES[i].fn, name) == 0)) {
+                if (strcmp(PATCHES[i].fn, name) == 0) return &PATCHES[i];
+            }
+        return NULL;
+    }
     return NULL;
 }
 
@@ -260,10 +310,19 @@ static int ieq(const char *a, const char *b) { return lstrcmpiA(a, b) == 0; }
 /* Rewrite import slots of one module. */
 static void note_module(HMODULE h, const char *modname)
 {
-    if (lstrcmpiA(modname, "winhttp.dll") != 0) return;
-    real_WinHttpSetOption = (pWinHttpSetOption)real_GetProcAddress(h, "WinHttpSetOption");
-    real_WinHttpQueryOption = (pWinHttpQueryOption)real_GetProcAddress(h, "WinHttpQueryOption");
-    g_winhttp = h;
+    for (size_t m = 0; m < NWRAPMODS; m++) {
+        if (lstrcmpiA(modname, WRAPMODS[m].dll) != 0) continue;
+        WRAPMODS[m].h = h;
+        if (m == 0) {
+            real_WinHttpSetOption = (pWinHttpSetOption)real_GetProcAddress(h, "WinHttpSetOption");
+            real_WinHttpQueryOption = (pWinHttpQueryOption)real_GetProcAddress(h, "WinHttpQueryOption");
+        } else {
+            real_InternetSetOptionW = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionW");
+            real_InternetSetOptionA = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionA");
+            real_InternetQueryOptionW = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionW");
+            real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
+        }
+    }
 }
 
 static void patch_module(HMODULE h, const char *modname)
@@ -398,7 +457,10 @@ static void CALLBACK on_dll_notify(ULONG reason, const LDR_NOTIFY_DATA *data, vo
 {
     (void)ctx;
     if (!data || !data->DllBase) return;
-    if (reason == 2 /* LDR_DLL_NOTIFICATION_REASON_UNLOADED */) { if ((HMODULE)data->DllBase == g_winhttp) g_winhttp = NULL; return; }
+    if (reason == 2 /* LDR_DLL_NOTIFICATION_REASON_UNLOADED */) {
+        for (size_t m = 0; m < NWRAPMODS; m++) if ((HMODULE)data->DllBase == WRAPMODS[m].h) WRAPMODS[m].h = NULL;
+        return;
+    }
     if (reason != 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */) return;
     char name[128] = "?";
     if (data->BaseDllName && data->BaseDllName->Buffer)
