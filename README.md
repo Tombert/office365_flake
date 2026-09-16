@@ -52,8 +52,8 @@ All optional, all environment variables:
 | `MS365_SCA` | `0` | `1` switches to Shared Computer Activation (business subscriptions only) instead of vNext token licensing |
 | `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
 | `MS365_TRACE_MODULE` | unset | debugging: the shim logs every export lookup into this DLL and every failed lookup (`MS365_DEBUG=1` to see them) |
-| `MS365_WAYLAND` | `0` | `1` runs Wine's Wayland driver instead of X11/Xwayland. Popup menus then stay open under sway and other wlroots compositors; see "Known problems" for what breaks |
-| `MS365_DPI` | unset | Wine dpi. Unset: 96, or 96 × the focused sway output's scale with `MS365_WAYLAND=1` |
+| `MS365_WAYLAND` | `1` | Wine's Wayland driver in a Wayland session; `0` for X11/Xwayland (popup menus close instantly there under sway and other wlroots compositors) |
+| `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver, 96 on X11 |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -73,7 +73,7 @@ MS365_RUNNER=protosoda MS365_EXCLUDE="Teams OneDrive Lync Bing Groove Outlook On
 
 ## What it took (and where it stands)
 
-Status as of 2026-09-15 with GE-Proton 11-6 and Microsoft 365 Apps build 16.0.20326.20144:
+Status as of 2026-09-16 with GE-Proton11-7 and Microsoft 365 Apps build 16.0.20326.20144:
 
 * The Office Deployment Tool downloads and installs the full suite inside the prefix.
 * Word starts (with `/q`, no splash screen), draws its start screen and ribbon, and shows the
@@ -97,7 +97,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
-| Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | Wine 11.0's `d2d1` ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. |
+| Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | GE-Proton 11's Wine (11.0 base) ships a `d2d1` that ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
@@ -149,17 +149,18 @@ on Wine's `JsonValue`).
   `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to
   MSGR*.LEX, hyphenation and thesaurus split between engine DLL and lexicon). Spelling works; if
   hyphenation or the thesaurus (Shift+F7) refuse a language, those two mappings are the suspects.
-* **Right-click and other popup menus close immediately under sway** (X11 driver, the default).
-  Office activates its popup, hides and re-shows it while positioning it, and sway's Xwayland layer
-  moves keyboard focus back to the main window in between; Wine then sends Office the message that
-  cancels the menu. `MS365_WAYLAND=1` avoids it (Wine's Wayland driver keeps focus inside Wine).
-* **The Wayland driver of GE-Proton 11 (Wine 11.0) is not ready for 2x outputs.** It renders at
-  physical pixels, reports the monitor at 96 dpi (tiny UI unless `MS365_DPI` raises it), declares the
-  window geometry in pixels but the viewport in logical units (input a few characters off, and once
-  Office's window outgrows the logical screen, at 168/180 dpi, sway stops delivering input at all),
-  crashes Office at exactly 192 dpi, and sometimes gets disconnected for committing a surface before
-  its configure. 144 dpi works. Wine reworked all of this after 11.0; unlike d2d1 the display driver
-  cannot be taken from a newer Wine. Revisit when GE-Proton moves past Wine 11.0.
+* **Right-click and other popup menus close immediately under sway on the X11 driver**
+  (`MS365_WAYLAND=0`). Office activates its popup, hides and re-shows it while positioning it, and
+  sway's Xwayland layer moves keyboard focus back to the main window in between; Wine then sends
+  Office the message that cancels the menu. The Wayland driver, the default, keeps focus inside Wine.
+* **Wayland driver and HiDPI.** The driver reports the monitor at 96 dpi, so the launcher sets Wine's
+  dpi from the sway output scale. At exactly 192 dpi Word overflows its main thread's stack while
+  building its first window (an Office recursion; same on GE-Proton 11-6 and 11-7), so the automatic
+  value is capped at 180, which renders and takes input correctly on GE-Proton11-7. GE-Proton11-6's
+  driver mixed pixel and logical coordinates in the window geometry (input offset, no input at all
+  at 168/180 dpi) and could get disconnected for committing a surface before its configure; the
+  flake pins 11-7 for its Wayland fixes. Still cosmetic: Word's "save changes?" prompt on exit
+  flickers the window for a moment.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
   GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the

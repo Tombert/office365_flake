@@ -42,10 +42,10 @@ umu_env() {
   export PROTON_NO_STEAM_FFMPEG=1
   export UMU_RUNTIME_UPDATE="${UMU_RUNTIME_UPDATE:-1}"
   export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"  # don't spam .desktop files
-  # MS365_WAYLAND=1: Wine's Wayland driver instead of X11 (Xwayland). Under wlroots compositors
-  # (sway, ...) Office's popup menus lose X focus the moment they open and close again; the Wayland
-  # driver keeps keyboard focus inside Wine. Ignored without a Wayland session.
-  if [ "${MS365_WAYLAND:-0}" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  # Wine's Wayland driver by default in a Wayland session (MS365_WAYLAND=0 for X11/Xwayland). Under
+  # wlroots compositors (sway, ...) Office's popup menus lose X focus the moment they open and close
+  # again; the Wayland driver keeps keyboard focus inside Wine.
+  if [ "${MS365_WAYLAND:-1}" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
     export PROTON_ENABLE_WAYLAND=1
     export PROTON_USE_X11_EXCLUSIVE=0
   else
@@ -136,17 +136,19 @@ apply_tricks() {
   printf '%s' "$MS365_WINETRICKS" > "$marker"
 }
 
-# Wine's Wayland driver exposes outputs at their physical size without scaling, so on a HiDPI
-# panel Office renders tiny at 96 dpi. MS365_DPI sets Wine's dpi; unset, it follows the focused
-# sway output's scale under MS365_WAYLAND=1 (96 * scale) and stays 96 otherwise (Xwayland scales).
+# Wine's Wayland driver exposes outputs at their physical size, so on a HiDPI panel Office renders
+# tiny at 96 dpi. MS365_DPI sets Wine's dpi; unset, it follows the focused sway output's scale on
+# the Wayland driver (96 * scale) and stays 96 on Xwayland, which scales by itself. Capped at 180:
+# at exactly 192 dpi Word overflows its main thread's stack while building its first window (an
+# Office recursion, same on GE-Proton 11-6 and 11-7); 180 renders and behaves fine.
 wine_dpi() {
   if [ -n "${MS365_DPI:-}" ]; then echo "$MS365_DPI"; return; fi
-  if [ "${MS365_WAYLAND:-0}" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ] && command -v swaymsg >/dev/null 2>&1; then
+  if [ "${MS365_WAYLAND:-1}" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ] && command -v swaymsg >/dev/null 2>&1; then
     swaymsg -t get_outputs 2>/dev/null | python3 -c '
 import json, sys
 outs = json.load(sys.stdin)
 o = next((o for o in outs if o.get("focused")), outs[0] if outs else {})
-print(int(round(96 * float(o.get("scale", 1)))))' 2>/dev/null && return
+print(min(180, int(round(96 * float(o.get("scale", 1))))))' 2>/dev/null && return
   fi
   echo 96
 }
@@ -575,8 +577,8 @@ Environment (all optional):
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
   MS365_RADV_DEBUG=<flags>  AMD driver debug flags to export as RADV_DEBUG (default: none)
   MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
-  MS365_WAYLAND=1  use Wine's Wayland driver (popup menus stay open under sway and other wlroots compositors)
-  MS365_DPI=<n>    Wine dpi (default: 96 * the focused sway output's scale with MS365_WAYLAND=1, else 96)
+  MS365_WAYLAND=0  use X11/Xwayland instead of Wine's Wayland driver (default 1 in a Wayland session)
+  MS365_DPI=<n>    Wine dpi (default: 96 * the focused sway output's scale, capped at 180, on the Wayland driver; 96 on X11)
   MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
   MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)
   UMU_LOG=debug   verbose umu output

@@ -12,7 +12,22 @@
       };
       lib = pkgs.lib;
 
-      protonGE = pkgs.proton-ge-bin.steamcompattool;
+      # nixpkgs' proton-ge-bin lags GE releases; GE-Proton11-7 (2026-09-16) is mostly Wine-Wayland
+      # fixes (presentation geometry, configure completion, popup handling, toplevel sizing), which is
+      # what MS365_WAYLAND=1 needs on HiDPI outputs. Override the version until nixpkgs catches up.
+      protonGEPkg = pkgs.proton-ge-bin.overrideAttrs (final: prev: {
+        version = "GE-Proton11-7";
+        passthru = prev.passthru // {
+          variants.x86_64-linux = {
+            toolName = "${final.version}-x86_64";
+            src = pkgs.fetchzip {
+              url = "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/${final.version}/${final.version}-x86_64.tar.gz";
+              hash = "sha256-ftW0vE45v2JsbaYqo/So0ZFfvdtakHX0XEXEE4TdxLk=";
+            };
+          };
+        };
+      });
+      protonGE = protonGEPkg.steamcompattool;
 
       # Bottles' Soda Wine core wrapped in the Proton layout that umu expects.
       # Soda 11.0-8 is the build family in which the Bottles maintainer reported
