@@ -201,6 +201,13 @@ Windows Registry Editor Version 5.00
 @="C:\\windows\\system32\\ms365uia.dll"
 "ThreadingModel"="Both"
 
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}]
+@="ms365 UIAutomationRegistrar"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}\InprocServer32]
+@="C:\\windows\\system32\\ms365uia.dll"
+"ThreadingModel"="Both"
+
 REG
   umu regedit /S "$reg"
   printf 'sppc,ole32,uia' > "$MS365_PREFIX/.ms365-shims"
@@ -329,6 +336,11 @@ cmd_run() {
     put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
     put_dll "$(ole32_shim_for_runner)" ole32.dll
     put_dll "$MS365_UIA_SHIM" ms365uia.dll
+    # a prefix update rewrites Wine's own class registrations; put ours back when they are gone
+    if ! grep -aqF 'ms365uia' "$root/system.reg" 2>/dev/null; then
+      log "re-registering shim COM classes"
+      install_shims
+    fi
   fi
   # Default switches: Word's /q skips the splash screen, whose thread trips a COM apartment
   # teardown race in Wine (null deref in combase) that takes the whole app down.
