@@ -42,6 +42,22 @@ static void fake_guid(SLID *id)
     *(LONG *)&id->Data4[4] = InterlockedIncrement(&counter);
 }
 
+/* ---- tracing (visible with PROTON_LOG / WINEDEBUG=+debugstr) ------------ */
+static void guid_str(const SLID *g, char *out)
+{
+    if (!g) { lstrcpyA(out, "(null)"); return; }
+    wsprintfA(out, "{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", g->Data1, g->Data2, g->Data3,
+              g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3], g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+}
+static void trace2(const char *fn, const SLID *a, const SLID *b, PCWSTR name, HRESULT hr)
+{
+    char ga[48], gb[48], buf[400];
+    guid_str(a, ga); guid_str(b, gb);
+    wsprintfA(buf, "sppc shim: %s app=%s sku=%s name=%ls -> 0x%08lx", fn, ga, gb, name ? name : L"", hr);
+    OutputDebugStringA(buf);
+}
+#define TRACE_RET(fn, a, b, name, hr) do { HRESULT _hr = (hr); trace2(fn, a, b, name, _hr); return _hr; } while (0)
+
 /* ---- session ---------------------------------------------------------- */
 API SLOpen(HSLC *handle)
 {
@@ -54,8 +70,9 @@ API SLClose(HSLC handle) { (void)handle; return S_OK; }
 /* ---- licence / proof-of-purchase installation: pretend it worked ------- */
 API SLInstallLicense(HSLC h, UINT cb, const BYTE *blob, SLID *file_id)
 {
-    (void)h; (void)cb; (void)blob;
+    (void)h; (void)blob;
     fake_guid(file_id);
+    { char buf[120]; wsprintfA(buf, "sppc shim: SLInstallLicense %u bytes", cb); OutputDebugStringA(buf); }
     return S_OK;
 }
 API SLUninstallLicense(HSLC h, const SLID *id) { (void)h; (void)id; return S_OK; }
@@ -78,30 +95,31 @@ API SLSetCurrentProductKey(HSLC h, const SLID *product, const SLID *pkey) { (voi
 /* ---- queries: nothing is ever found ---------------------------------- */
 API SLGetLicensingStatusInformation(HSLC h, const SLID *app, const SLID *product, PCWSTR right, UINT *count, void **status)
 {
-    (void)h; (void)app; (void)product; (void)right;
+    (void)h;
     if (count) *count = 0;
     if (status) *status = NULL;
-    return SL_E_RIGHT_NOT_CONSUMED; /* same as Wine's builtin */
+    TRACE_RET("SLGetLicensingStatusInformation", app, product, right, SL_E_RIGHT_NOT_CONSUMED); /* same as Wine's builtin */
 }
 API SLGetSLIDList(HSLC h, int qtype, const SLID *qid, int rtype, UINT *count, SLID **ids)
 {
-    (void)h; (void)qtype; (void)qid; (void)rtype;
+    (void)h;
     if (count) *count = 0;
     if (ids) *ids = NULL;
-    return S_OK;
+    { char buf[160]; wsprintfA(buf, "sppc shim: SLGetSLIDList qtype=%d rtype=%d", qtype, rtype); OutputDebugStringA(buf); }
+    TRACE_RET("SLGetSLIDList", qid, NULL, NULL, S_OK);
 }
 API SLGetInstalledProductKeyIds(HSLC h, const SLID *product, UINT *count, SLID **ids)
 {
-    (void)h; (void)product;
+    (void)h;
     if (count) *count = 0;
     if (ids) *ids = NULL;
-    return S_OK;
+    TRACE_RET("SLGetInstalledProductKeyIds", product, NULL, NULL, S_OK);
 }
 
 /* generic "name -> typed blob" getters: (h, id, name, type*, size*, data**) */
 #define NOT_FOUND_GETTER(name) \
     API name(HSLC h, const SLID *id, PCWSTR value, int *type, UINT *size, PBYTE *data) \
-    { (void)h; (void)id; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+    { (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET(#name, id, NULL, value, SL_E_VALUE_NOT_FOUND); }
 NOT_FOUND_GETTER(SLGetPKeyInformation)
 NOT_FOUND_GETTER(SLGetProductSkuInformation)
 NOT_FOUND_GETTER(SLGetLicenseInformation)
@@ -109,14 +127,14 @@ NOT_FOUND_GETTER(SLGetApplicationInformation)
 
 /* policy getters take a policy handle and no SLID: (h, name, type*, size*, data**) */
 API SLGetPolicyInformation(HSLP h, PCWSTR value, int *type, UINT *size, PBYTE *data)
-{ (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetPolicyInformation", NULL, NULL, value, SL_E_VALUE_NOT_FOUND); }
 API SLGetApplicationPolicy(HSLP h, PCWSTR value, int *type, UINT *size, PBYTE *data)
-{ (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetApplicationPolicy", NULL, NULL, value, SL_E_VALUE_NOT_FOUND); }
 
 API SLGetServiceInformation(HSLC h, PCWSTR value, int *type, UINT *size, PBYTE *data)
-{ (void)h; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetServiceInformation", NULL, NULL, value, SL_E_VALUE_NOT_FOUND); }
 API SLGetPolicyInformationDWORD(HSLP h, PCWSTR value, DWORD *out)
-{ (void)h; (void)value; if (out) *out = 0; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (out) *out = 0; TRACE_RET("SLGetPolicyInformationDWORD", NULL, NULL, value, SL_E_VALUE_NOT_FOUND); }
 API SLGetGenuineInformation(const SLID *id, PCWSTR value, int *type, UINT *size, PBYTE *data)
 { (void)id; (void)value; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
 API SLGetLicense(HSLC h, const SLID *file_id, UINT *size, PBYTE *data)
@@ -142,13 +160,13 @@ API SLGatherMigrationBlobEx(BOOL migratable, BOOL user, UINT *size, PBYTE data)
 
 /* rights: never granted through SPP, so Office asks its own (vNext) licensing */
 API SLConsumeRight(HSLC h, const SLID *app, const SLID *product, PCWSTR right, void *reserved)
-{ (void)h; (void)app; (void)product; (void)right; (void)reserved; return SL_E_RIGHT_NOT_GRANTED; }
+{ (void)h; (void)reserved; TRACE_RET("SLConsumeRight", app, product, right, SL_E_RIGHT_NOT_GRANTED); }
 
 API SLIsGenuineLocalEx(const SLID *app, const SLID *alt, int *state)
 { (void)app; (void)alt; if (state) *state = 0 /* SL_GEN_STATE_IS_GENUINE */; return S_OK; }
 
 API SLLoadApplicationPolicies(const SLID *app, const SLID *product, DWORD flags, HSLP *handle)
-{ (void)app; (void)product; (void)flags; if (handle) *handle = (HSLP)(ULONG_PTR)0x534c504f; return S_OK; }
+{ (void)flags; if (handle) *handle = (HSLP)(ULONG_PTR)0x534c504f; TRACE_RET("SLLoadApplicationPolicies", app, product, NULL, S_OK); }
 API SLUnloadApplicationPolicies(HSLP handle, DWORD flags) { (void)handle; (void)flags; return S_OK; }
 API SLPersistApplicationPolicies(const SLID *app, const SLID *product, DWORD flags)
 { (void)app; (void)product; (void)flags; return S_OK; }
