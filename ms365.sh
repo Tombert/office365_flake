@@ -123,6 +123,8 @@ apply_tricks() {
   printf '%s' "$MS365_WINETRICKS" > "$marker"
 }
 
+# bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
+REGISTRY_REV=2
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
@@ -195,17 +197,25 @@ Windows Registry Editor Version 5.00
 "Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
 "Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
 REG
-  if [ "${MS365_SCA:-1}" != 0 ]; then
-    cat >> "$reg" <<'REG'
+  # Licensing mode. Office's legacy path validates the Software Protection Platform state at every
+  # start and Word refuses to run when that fails (it always does under Wine: 0xC004E003). The
+  # token-based "vNext" mode (LicensingNext = 2, what Microsoft 365 Apps use since version 1910)
+  # skips that validation and licenses the product from the signed-in account instead, which is the
+  # path a personal Microsoft 365 subscription takes. Shared Computer Activation (MS365_SCA=1) is the
+  # other token-based mode; only business subscriptions can use it, a personal one is refused with
+  # "cannot be used to activate Office in shared computer scenarios" (0x80004005).
+  local sca=0; [ "${MS365_SCA:-0}" = 1 ] && sca=1
+  cat >> "$reg" <<REG
 
-; Shared Computer Activation: license through a signed-in account token instead of SPP product
-; activation (Wine has no Software Protection service). MS365_SCA=0 leaves this off.
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\ClickToRun\Configuration]
-"SharedComputerLicensing"="1"
+[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Office\\ClickToRun\\Configuration]
+"SharedComputerLicensing"="$sca"
+
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Common\\Licensing\\LicensingNext]
+"$MS365_PRODUCT"=dword:00000002
 REG
-  fi
   log "Applying registry tweaks"
   umu regedit /S "$reg"
+  printf '%s' "$REGISTRY_REV" > "$MS365_PREFIX/.ms365-registry"
 }
 
 # Native DLL shims (x86_64 only; see sppc/ and ole32-shim/ in the flake):
@@ -385,6 +395,8 @@ cmd_run() {
     log "clearing $regname safe-mode prompt from the last crash"
     umu reg delete "HKCU\\Software\\Microsoft\\Office\\16.0\\$regname\\Resiliency" /f >/dev/null 2>&1 || true
   fi
+  # registry tweaks added after the prefix was installed
+  if [ "$(cat "$MS365_PREFIX/.ms365-registry" 2>/dev/null)" != "$REGISTRY_REV" ]; then apply_registry; fi
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
   if [ "$MS365_EDITION" = 64 ]; then
@@ -475,7 +487,7 @@ Environment (all optional):
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
-  MS365_SCA=0     don't enable Shared Computer Activation (account-token licensing) in the prefix
+  MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)
   UMU_LOG=debug   verbose umu output
 USG
 }

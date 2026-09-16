@@ -49,6 +49,7 @@ All optional, all environment variables:
 | `MS365_EXCLUDE` | `Teams OneDrive Lync Bing Groove` | ODT `ExcludeApp` ids. Add `Outlook OneNote Access Publisher` for a minimal install |
 | `MS365_WINETRICKS` | `corefonts msxml6 riched20 gdiplus` | Verbs applied before install |
 | `MS365_ODT_SETUP` | unset | Use a local ODT `setup.exe` instead of downloading the current one |
+| `MS365_SCA` | `0` | `1` switches to Shared Computer Activation (business subscriptions only) instead of vNext token licensing |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -89,6 +90,9 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Word: splash-screen thread crashes in combase during COM apartment teardown, Office's crash handler kills the app | Word is launched with `/q` |
 | `mso.dll` and friends live in Office's VFS tree; the App-V redirection layer is unreliable under Wine | the VFS tree is mirrored into `Program Files` with symlinks |
 | Office offers safe mode after every crash via a modal prompt | the launcher clears the Resiliency key before starting an app |
+| Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
+| Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
+| Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
 lists every unresolved import ("No implementation for ..."), which is how the kernel32 gaps were
@@ -100,21 +104,37 @@ Click-to-Run, `Diagnostics/<APP>/` for the apps).
 Office licenses itself through the Windows Software Protection Platform (SPP), which Wine does not
 have. The `sppc/` shim is a minimal stand-in: it stores the licence files the installer hands it,
 serves the SKU policies from them, and lets the out-of-box 5-day Grace licence run with a persisted
-timer, which is what a fresh Windows install does before activation. Nothing is reported as
-activated and no product keys are installed. It also answers Office's SPP authentication handshake
-by echoing the challenge, which is enough for Office to proceed to its own activation flow.
+timer. Nothing is reported as activated and no product keys are installed. Office's full SPP
+validation still fails under Wine (0xC004E003), and on the legacy licensing path Word then refuses
+to run ("Word has run into an error ... repair now?").
 
-With Shared Computer Activation enabled (`MS365_SCA`, on by default) Office licenses through a
-signed-in account token instead of SPP activation, and Word starts as "Unlicensed Product" with the
-"Sign in to set up Office" wizard. Sign in reaches the real Microsoft login page (OneAuth on, both
-Web Account Manager paths off in `Common\Identity`). What has not worked: signing in with a personal
-Microsoft account (Gmail-style MSA). After home-realm discovery OneAuth insists on the Windows Web
-Account Manager for MSA, a WinRT service Wine lacks, and fails with 0x80040154. A work or school
-(Entra ID) account takes the browser path and is the one to try; it is also the kind of account
-Shared Computer Activation is designed for.
+The flake therefore puts the product into Microsoft's token-based licensing mode ("vNext",
+`HKCU\...\Common\Licensing\LicensingNext\<product> = 2`, what Microsoft 365 Apps use since
+version 1910). In that mode Office skips the SPP validation, starts as "Unlicensed Product", and
+licenses itself from the signed-in account through the Office Licensing Service. Shared Computer
+Activation (`MS365_SCA=1`) is the alternative token mode for business subscriptions; a personal
+subscription is refused there with "cannot be used to activate Office in shared computer
+scenarios" (0x80004005).
 
-Extras that are in the prefix but not in the flake recipe: the Edge WebView2 runtime
-(`ms365 winetricks webview2`, 680 MB), installed while chasing this; unclear whether it matters.
+Sign-in works with a personal Microsoft account: OneAuth is kept, both Web Account Manager paths
+are switched off (`Common\Identity` and the Policies hives), the OneAuth broker is disabled and its
+login page is rendered by the Edge WebView2 runtime (feature gates under
+`ExperimentConfigs\ExternalFeatureOverrides`). The WebView2 runtime is not in the flake recipe yet:
+`ms365 winetricks webview2` (680 MB) installs it into the prefix. Two request paths needed help from
+the ole32 shim: Wine's winhttp and wininet reject option codes they have not implemented with
+error 12009, which Office reports as sign-in error 53u4r / code 12009, so the shim accepts those
+tuning options.
+
+What has been verified: sign-in completes, Word shows the account's OneDrive documents, and Office
+fetches the account's entitlements. What has not: an actual licence, because the test account had
+no Microsoft 365 subscription that includes the desktop apps. In that case Office tries to open its
+in-app purchase dialog, a WebView2 window in DirectComposition mode, and Wine's DirectComposition is
+a stub, so Word exits with code 64 instead. Buy or manage the subscription on the web, then sign in
+again in Word.
+
+Other WinRT gaps the ole32 shim fills for the licensing code: `Windows.Globalization.Language`
+statics (`ILanguageStatics`) and `Windows.Data.Json.JsonObject` statics (`Parse`/`TryParse`, built
+on Wine's `JsonValue`).
 
 ## Expectations
 
