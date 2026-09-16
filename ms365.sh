@@ -147,7 +147,25 @@ Windows Registry Editor Version 5.00
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Installer]
 "Logging"="voicewarmupx"
 "Debug"=dword:00000007
+
+; Sign-in: Office's OneAuth stack wants the Windows Web Account Manager (WinRT classes Wine lacks,
+; REGDB_E_CLASSNOTREG); these documented switches make it use the browser-based flow instead.
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\Identity]
+"EnableADAL"=dword:00000001
+"DisableADALatopWAMOverride"=dword:00000001
+"DisableAADWAM"=dword:00000001
+"DisableMSAWAM"=dword:00000001
+"DisableOneAuth"=dword:00000001
 REG
+  if [ "${MS365_SCA:-1}" != 0 ]; then
+    cat >> "$reg" <<'REG'
+
+; Shared Computer Activation: license through a signed-in account token instead of SPP product
+; activation (Wine has no Software Protection service). MS365_SCA=0 leaves this off.
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\ClickToRun\Configuration]
+"SharedComputerLicensing"="1"
+REG
+  fi
   log "Applying registry tweaks"
   umu regedit /S "$reg"
 }
@@ -419,6 +437,7 @@ Environment (all optional):
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
+  MS365_SCA=0     don't enable Shared Computer Activation (account-token licensing) in the prefix
   UMU_LOG=debug   verbose umu output
 USG
 }
