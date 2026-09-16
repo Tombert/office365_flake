@@ -155,7 +155,7 @@ Windows Registry Editor Version 5.00
 "DisableADALatopWAMOverride"=dword:00000001
 "DisableAADWAM"=dword:00000001
 "DisableMSAWAM"=dword:00000001
-"DisableOneAuth"=dword:00000001
+"DisableOneAuth"=dword:00000000
 REG
   if [ "${MS365_SCA:-1}" != 0 ]; then
     cat >> "$reg" <<'REG'
