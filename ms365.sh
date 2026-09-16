@@ -306,7 +306,7 @@ cmd_run() {
   # of life under Wine, so clear that flag unless MS365_KEEP_SAFEMODE_PROMPT=1. Only spend an extra
   # umu round-trip when the key is actually present in the hive.
   local regname; regname="$(app_regname "$app")"
-  local hivekey; hivekey='Office\\16.0\\'"$regname"'\\Resiliency'   # hives escape backslashes
+  local hivekey; hivekey=$(printf 'Office\\\\16.0\\\\%s\\\\Resiliency' "$regname")   # hives escape backslashes
   if [ "${MS365_KEEP_SAFEMODE_PROMPT:-0}" = 0 ] && grep -aqF "$hivekey" "$root/user.reg" 2>/dev/null; then
     log "clearing $regname safe-mode prompt from the last crash"
     umu reg delete "HKCU\\Software\\Microsoft\\Office\\16.0\\$regname\\Resiliency" /f >/dev/null 2>&1 || true
