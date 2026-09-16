@@ -21,6 +21,7 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dwrite.h>
+#include <msi.h>
 #include <d2d1_1.h>
 typedef LPVOID HINTERNET;
 #include <winternl.h>
@@ -535,6 +536,61 @@ static HRESULT WINAPI my_D2D1CreateDevice(IDXGIDevice *dxgi, const D2D1_CREATION
     return hr;
 }
 
+
+/* ---- Windows Installer: empty product code = "whichever package owns it" ----------------------
+ * Office validates its proofing host through msi.dll with an empty product code
+ * (MsiQueryFeatureState("", "OfficeMSProof6"), MsiGetComponentPathEx("", msspell7 component)).
+ * Click-to-Run's App-V layer answers those on Windows; Wine's msi rejects an empty product as
+ * INSTALLSTATE_INVALIDARG and Word decides the speller is missing. Resolve the empty product against
+ * the registered products (launcher: msi-components.py) and answer with the first that knows it. */
+typedef INSTALLSTATE (WINAPI *pMsiQueryFeatureStateW)(LPCWSTR, LPCWSTR);
+typedef INSTALLSTATE (WINAPI *pMsiGetComponentPathExW)(LPCWSTR, LPCWSTR, LPCWSTR, MSIINSTALLCONTEXT, LPWSTR, LPDWORD);
+typedef INSTALLSTATE (WINAPI *pMsiGetComponentPathW)(LPCWSTR, LPCWSTR, LPWSTR, LPDWORD);
+typedef UINT (WINAPI *pMsiEnumClientsW)(LPCWSTR, DWORD, LPWSTR);
+typedef UINT (WINAPI *pMsiEnumProductsW)(DWORD, LPWSTR);
+static pMsiQueryFeatureStateW real_MsiQueryFeatureStateW; static pMsiGetComponentPathExW real_MsiGetComponentPathExW;
+static pMsiGetComponentPathW real_MsiGetComponentPathW; static pMsiEnumClientsW real_MsiEnumClientsW; static pMsiEnumProductsW real_MsiEnumProductsW;
+static LONG g_msi_logs;
+static void msi_log(const char *fn, LPCWSTR arg, LPCWSTR product, int state)
+{
+    char msg[300];
+    if (InterlockedIncrement(&g_msi_logs) > 40) return;
+    wsprintfA(msg, "ms365 ole32 shim: %s(\"\", %ls) -> product %ls state %d", fn, arg, product ? product : L"(none)", state);
+    OutputDebugStringA(msg);
+}
+static INSTALLSTATE WINAPI my_MsiQueryFeatureStateW(LPCWSTR product, LPCWSTR feature)
+{
+    WCHAR prod[64];
+    if ((product && product[0]) || !real_MsiEnumProductsW || !feature) return real_MsiQueryFeatureStateW(product, feature);
+    for (DWORD i = 0; real_MsiEnumProductsW(i, prod) == ERROR_SUCCESS; i++) {
+        INSTALLSTATE st = real_MsiQueryFeatureStateW(prod, feature);
+        if (st == INSTALLSTATE_LOCAL || st == INSTALLSTATE_SOURCE || st == INSTALLSTATE_ADVERTISED) { msi_log("MsiQueryFeatureStateW", feature, prod, st); return st; }
+    }
+    msi_log("MsiQueryFeatureStateW", feature, NULL, INSTALLSTATE_UNKNOWN);
+    return INSTALLSTATE_UNKNOWN;
+}
+static INSTALLSTATE component_path_any(LPCWSTR component, LPCWSTR sid, MSIINSTALLCONTEXT ctx, int ex, LPWSTR buf, LPDWORD len, const char *fn)
+{
+    WCHAR prod[64]; INSTALLSTATE st = INSTALLSTATE_UNKNOWN;
+    for (DWORD i = 0; real_MsiEnumClientsW(component, i, prod) == ERROR_SUCCESS; i++) {
+        DWORD n = len ? *len : 0;
+        st = ex ? real_MsiGetComponentPathExW(prod, component, sid, ctx, buf, len ? &n : NULL) : real_MsiGetComponentPathW(prod, component, buf, len ? &n : NULL);
+        if (st == INSTALLSTATE_LOCAL || st == INSTALLSTATE_SOURCE || st == INSTALLSTATE_MOREDATA) { if (len) *len = n; msi_log(fn, component, prod, st); return st; }
+    }
+    msi_log(fn, component, NULL, st);
+    return st;
+}
+static INSTALLSTATE WINAPI my_MsiGetComponentPathExW(LPCWSTR product, LPCWSTR component, LPCWSTR sid, MSIINSTALLCONTEXT ctx, LPWSTR buf, LPDWORD len)
+{
+    if ((product && product[0]) || !real_MsiEnumClientsW || !component) return real_MsiGetComponentPathExW(product, component, sid, ctx, buf, len);
+    return component_path_any(component, sid, ctx, 1, buf, len, "MsiGetComponentPathExW");
+}
+static INSTALLSTATE WINAPI my_MsiGetComponentPathW(LPCWSTR product, LPCWSTR component, LPWSTR buf, LPDWORD len)
+{
+    if ((product && product[0]) || !real_MsiEnumClientsW || !component) return real_MsiGetComponentPathW(product, component, buf, len);
+    return component_path_any(component, NULL, 0, 0, buf, len, "MsiGetComponentPathW");
+}
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
@@ -546,6 +602,9 @@ static const struct patch PATCHES[] = {
     { "combase.dll",  "RoGetActivationFactory",      (void *)my_RoGetActivationFactory },
     { "d2d1.dll",     "D2D1CreateFactory",           (void *)my_D2D1CreateFactory },
     { "d2d1.dll",     "D2D1CreateDevice",            (void *)my_D2D1CreateDevice },
+    { "msi.dll",      "MsiQueryFeatureStateW",       (void *)my_MsiQueryFeatureStateW },
+    { "msi.dll",      "MsiGetComponentPathExW",      (void *)my_MsiGetComponentPathExW },
+    { "msi.dll",      "MsiGetComponentPathW",        (void *)my_MsiGetComponentPathW },
     { "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", (void *)my_RoGetActivationFactory },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
@@ -564,6 +623,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "combase.dll", NULL },
     { "api-ms-win-core-winrt-l1-1-0.dll", NULL },
     { "d2d1.dll", NULL },
+    { "msi.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports d2d1 by ordinal (Windows' d2d1.dll exports D2D1CreateFactory as #1); Wine's
@@ -625,6 +685,12 @@ static void note_module(HMODULE h, const char *modname)
         } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
             real_D2D1CreateFactory = (pD2D1CreateFactory)real_GetProcAddress(h, "D2D1CreateFactory");
             real_D2D1CreateDevice = (pD2D1CreateDevice)real_GetProcAddress(h, "D2D1CreateDevice");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
+            real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
+            real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");
+            real_MsiGetComponentPathW = (pMsiGetComponentPathW)real_GetProcAddress(h, "MsiGetComponentPathW");
+            real_MsiEnumClientsW = (pMsiEnumClientsW)real_GetProcAddress(h, "MsiEnumClientsW");
+            real_MsiEnumProductsW = (pMsiEnumProductsW)real_GetProcAddress(h, "MsiEnumProductsW");
         }
     }
 }
