@@ -23,9 +23,9 @@ typedef HANDLE HSLP;
 typedef GUID   SLID;
 
 #ifndef SL_E_VALUE_NOT_FOUND
+#define SL_E_RIGHT_NOT_CONSUMED    ((HRESULT)0xC004F002)   /* values from Wine's include/slerror.h */
 #define SL_E_VALUE_NOT_FOUND       ((HRESULT)0xC004F012)
-#define SL_E_RIGHT_NOT_CONSUMED    ((HRESULT)0xC004F013)
-#define SL_E_RIGHT_NOT_GRANTED     ((HRESULT)0xC004F00C)
+#define SL_E_RIGHT_NOT_GRANTED     ((HRESULT)0xC004F013)
 #endif
 
 #define API __declspec(dllexport) HRESULT WINAPI
