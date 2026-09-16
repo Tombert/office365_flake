@@ -186,28 +186,34 @@ static const struct patch STUBPATCHES[] = {
 #define MY_WINHTTP_OPTION_AUTOLOGON_POLICY     77
 #define MY_WINHTTP_OPTION_IPV6_FAST_FALLBACK   140
 #define MY_ERROR_WINHTTP_INVALID_OPTION        12009
+/* Wine reports an unknown option as 12009 (session/connect handles) or ERROR_INVALID_PARAMETER 87
+ * (request handles); ERROR_WINHTTP_INCORRECT_HANDLE_TYPE 12018 for handles with no query table. */
+static int unknown_option_error(DWORD err) { return err == MY_ERROR_WINHTTP_INVALID_OPTION || err == ERROR_INVALID_PARAMETER || err == 12018; }
 typedef BOOL (WINAPI *pWinHttpSetOption)(HANDLE, DWORD, LPVOID, DWORD);
 typedef BOOL (WINAPI *pWinHttpQueryOption)(HANDLE, DWORD, LPVOID, LPDWORD);
+static pWinHttpSetOption real_WinHttpSetOption;
+static pWinHttpQueryOption real_WinHttpQueryOption;
 static BOOL WINAPI my_WinHttpSetOption(HANDLE h, DWORD option, LPVOID buf, DWORD len)
 {
-    HMODULE m = GetModuleHandleA("winhttp.dll");
-    pWinHttpSetOption fn = m ? (pWinHttpSetOption)real_GetProcAddress(m, "WinHttpSetOption") : NULL;
+    pWinHttpSetOption fn = real_WinHttpSetOption;
     if (fn && fn(h, option, buf, len)) return TRUE;
     DWORD err = GetLastError();
-    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option >= 128) { SetLastError(0); return TRUE; } /* newer tuning options: accept */
-    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY) { SetLastError(0); return TRUE; }
+    if (unknown_option_error(err) && (option >= 128 || option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY)) {
+        char b[96]; wsprintfA(b, "ms365 ole32 shim: WinHttpSetOption %lu accepted (unimplemented in Wine)", option); OutputDebugStringA(b);
+        SetLastError(0); return TRUE; /* newer tuning options and the autologon policy: accept */
+    }
     SetLastError(err);
     return FALSE;
 }
 static BOOL WINAPI my_WinHttpQueryOption(HANDLE h, DWORD option, LPVOID buf, LPDWORD len)
 {
-    HMODULE m = GetModuleHandleA("winhttp.dll");
-    pWinHttpQueryOption fn = m ? (pWinHttpQueryOption)real_GetProcAddress(m, "WinHttpQueryOption") : NULL;
+    pWinHttpQueryOption fn = real_WinHttpQueryOption;
     if (fn && fn(h, option, buf, len)) return TRUE;
     DWORD err = GetLastError();
-    if (err == MY_ERROR_WINHTTP_INVALID_OPTION && option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY && len) {
+    if (unknown_option_error(err) && option == MY_WINHTTP_OPTION_AUTOLOGON_POLICY && len) {
         if (!buf || *len < sizeof(DWORD)) { *len = sizeof(DWORD); SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
         *(DWORD *)buf = 1; /* WINHTTP_AUTOLOGON_SECURITY_LEVEL_MEDIUM, the Windows default */
+        OutputDebugStringA("ms365 ole32 shim: WinHttpQueryOption 77 answered with the default autologon policy");
         *len = sizeof(DWORD);
         SetLastError(0);
         return TRUE;
@@ -227,13 +233,16 @@ static const struct patch PATCHES[] = {
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
-/* PATCHES entries that wrap an existing export (not GetProcAddress itself), keyed by module */
+/* PATCHES entries that wrap an existing export (not GetProcAddress itself), keyed by module.
+ * No API calls in here: Office's App-V layer (AppVIsvSubsystems64) detours kernel32 entry points
+ * such as GetModuleHandleA and fails fast when they are re-entered from inside a GetProcAddress
+ * that it is making itself. The winhttp handle is recorded by the loader notification instead. */
+static HMODULE g_winhttp;
 static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name)
 {
-    static HMODULE winhttp; if (!winhttp) winhttp = GetModuleHandleA("winhttp.dll");
-    if (!winhttp || h != winhttp) return NULL;
+    if (!g_winhttp || h != g_winhttp) return NULL;
     for (size_t i = 0; i < NPATCHES; i++)
-        if (lstrcmpiA(PATCHES[i].dll, "winhttp.dll") == 0 && strcmp(PATCHES[i].fn, name) == 0) return &PATCHES[i];
+        if (PATCHES[i].dll[0] == 'w' && lstrcmpiA(PATCHES[i].dll, "winhttp.dll") == 0 && strcmp(PATCHES[i].fn, name) == 0) return &PATCHES[i];
     return NULL;
 }
 
@@ -249,6 +258,14 @@ static void dbg(const char *what, const char *mod, const char *fn)
 static int ieq(const char *a, const char *b) { return lstrcmpiA(a, b) == 0; }
 
 /* Rewrite import slots of one module. */
+static void note_module(HMODULE h, const char *modname)
+{
+    if (lstrcmpiA(modname, "winhttp.dll") != 0) return;
+    real_WinHttpSetOption = (pWinHttpSetOption)real_GetProcAddress(h, "WinHttpSetOption");
+    real_WinHttpQueryOption = (pWinHttpQueryOption)real_GetProcAddress(h, "WinHttpQueryOption");
+    g_winhttp = h;
+}
+
 static void patch_module(HMODULE h, const char *modname)
 {
     BYTE *base = (BYTE *)h;
@@ -380,10 +397,13 @@ typedef LONG (NTAPI *pLdrRegisterDllNotification)(ULONG flags, LDR_NOTIFY_FN fn,
 static void CALLBACK on_dll_notify(ULONG reason, const LDR_NOTIFY_DATA *data, void *ctx)
 {
     (void)ctx;
-    if (reason != 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */ || !data || !data->DllBase) return;
+    if (!data || !data->DllBase) return;
+    if (reason == 2 /* LDR_DLL_NOTIFICATION_REASON_UNLOADED */) { if ((HMODULE)data->DllBase == g_winhttp) g_winhttp = NULL; return; }
+    if (reason != 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */) return;
     char name[128] = "?";
     if (data->BaseDllName && data->BaseDllName->Buffer)
         WideCharToMultiByte(CP_ACP, 0, data->BaseDllName->Buffer, data->BaseDllName->Length / 2, name, sizeof(name) - 1, NULL, NULL);
+    note_module((HMODULE)data->DllBase, name);
     patch_module((HMODULE)data->DllBase, name);
     patch_stubs((HMODULE)data->DllBase, name);
 }
@@ -405,6 +425,7 @@ static void patch_loaded_modules(void)
     for (DWORD i = 0; i < n; i++) {
         char name[128] = "?";
         baseName(GetCurrentProcess(), mods[i], name, sizeof(name));
+        note_module(mods[i], name);
         patch_module(mods[i], name);
         patch_stubs(mods[i], name);
     }
