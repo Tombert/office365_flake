@@ -502,6 +502,35 @@ static INSTALLSTATE WINAPI my_MsiGetComponentPathW(LPCWSTR product, LPCWSTR comp
     return component_path_any(component, NULL, 0, 0, buf, len, "MsiGetComponentPathW");
 }
 
+
+/* ---- Office's border-effect windows -----------------------------------------------------------
+ * Office draws dialog and menu shadows with unowned, layered MSO_BORDEREFFECT_WINDOW_CLASS popups
+ * (thin strips around the decorated window). Wine's Wayland driver can only turn an unowned popup
+ * into an independent xdg toplevel, which tiling compositors (sway) then tile: the layout reshuffles,
+ * Word's document swapchain loses its surface, and everything flickers until the strip goes away.
+ * Give those strips an owner (the active window, i.e. the one being decorated), which makes them
+ * transient windows: positioned relative to the owner and floated by the compositor. */
+typedef HWND (WINAPI *pCreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+static pCreateWindowExW real_CreateWindowExW; static LONG g_border_logs;
+static HWND WINAPI my_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
+{
+    HWND hwnd = real_CreateWindowExW(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
+    if (hwnd && !parent && (style & WS_POPUP) && (ex & WS_EX_LAYERED)) {
+        WCHAR cn[64];
+        if (GetClassNameW(hwnd, cn, 64) && lstrcmpiW(cn, L"MSO_BORDEREFFECT_WINDOW_CLASS") == 0) {
+            HWND owner = GetActiveWindow();
+            if (!owner) owner = GetForegroundWindow();
+            if (owner && owner != hwnd) {
+                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)owner);
+                if (InterlockedIncrement(&g_border_logs) <= 20) {
+                    char msg[160]; wsprintfA(msg, "ms365 ole32 shim: border-effect window %p owned by %p", hwnd, owner); OutputDebugStringA(msg);
+                }
+            }
+        }
+    }
+    return hwnd;
+}
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
@@ -514,6 +543,7 @@ static const struct patch PATCHES[] = {
     { "msi.dll",      "MsiQueryFeatureStateW",       (void *)my_MsiQueryFeatureStateW },
     { "msi.dll",      "MsiGetComponentPathExW",      (void *)my_MsiGetComponentPathExW },
     { "msi.dll",      "MsiGetComponentPathW",        (void *)my_MsiGetComponentPathW },
+    { "user32.dll",   "CreateWindowExW",             (void *)my_CreateWindowExW },
     { "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", (void *)my_RoGetActivationFactory },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
@@ -532,6 +562,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "combase.dll", NULL },
     { "api-ms-win-core-winrt-l1-1-0.dll", NULL },
     { "msi.dll", NULL },
+    { "user32.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -591,6 +622,8 @@ static void note_module(HMODULE h, const char *modname)
             real_InternetSetOptionA = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionA");
             real_InternetQueryOptionW = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionW");
             real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "user32.dll") == 0) {
+            real_CreateWindowExW = (pCreateWindowExW)real_GetProcAddress(h, "CreateWindowExW");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");

@@ -98,6 +98,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
 | Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | GE-Proton 11's Wine (11.0 base) ships a `d2d1` that ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. |
+| Dialogs (e.g. "save changes?") make the whole window flicker and the document area draw at the wrong scale on the Wayland driver | Office draws dialog shadows with unowned layered `MSO_BORDEREFFECT_WINDOW_CLASS` popups; the Wayland driver makes each an independent toplevel, sway tiles them and the layout reshuffles until the dialog closes. The shim gives those windows an owner (the active window), so they become transient and float |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
@@ -159,8 +160,7 @@ on Wine's `JsonValue`).
   value is capped at 180, which renders and takes input correctly on GE-Proton11-7. GE-Proton11-6's
   driver mixed pixel and logical coordinates in the window geometry (input offset, no input at all
   at 168/180 dpi) and could get disconnected for committing a surface before its configure; the
-  flake pins 11-7 for its Wayland fixes. Still cosmetic: Word's "save changes?" prompt on exit
-  flickers the window for a moment.
+  flake pins 11-7 for its Wayland fixes.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
   GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the
