@@ -93,6 +93,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
+| "Missing proofing tools" banner although the dictionaries are installed | Office finds proofing engines through MSI component registrations the Click-to-Run integrator never wrote under Wine; `msi-components.py` rebuilds them from the package manifests |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
 lists every unresolved import ("No implementation for ..."), which is how the kernel32 gaps were

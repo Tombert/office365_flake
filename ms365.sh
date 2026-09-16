@@ -46,8 +46,10 @@ umu_env() {
   export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
   mkdir -p "$MS365_PREFIX" "$LOG_DIR"
   # MS365_DEBUG=1 turns on Proton's wine log (+seh etc.) -> $LOG_DIR/steam-<appid>.log
+  # MS365_WINEDEBUG replaces Proton's default channel list, e.g. "+timestamp,+pid,+tid,+debugstr,+reg"
   if [ "${MS365_DEBUG:-0}" != 0 ]; then
     export PROTON_LOG=1 PROTON_LOG_DIR="$LOG_DIR"
+    if [ -n "${MS365_WINEDEBUG:-}" ]; then export WINEDEBUG="$MS365_WINEDEBUG"; fi
   fi
 }
 
@@ -124,7 +126,7 @@ apply_tricks() {
 }
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
-REGISTRY_REV=2
+REGISTRY_REV=4
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
@@ -212,7 +214,16 @@ REG
 
 [HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Common\\Licensing\\LicensingNext]
 "$MS365_PRODUCT"=dword:00000002
+
 REG
+  # Optional Office theme pin (0 colorful, 3 dark gray, 4 black, 5 white); unset = leave Office's choice.
+  if [ -n "${MS365_THEME:-}" ]; then
+    cat >> "$reg" <<REG
+
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Common]
+"UI Theme"=dword:0000000$MS365_THEME
+REG
+  fi
   log "Applying registry tweaks"
   umu regedit /S "$reg"
   printf '%s' "$REGISTRY_REV" > "$MS365_PREFIX/.ms365-registry"
@@ -312,8 +323,25 @@ mirror_vfs() {
   return 0
 }
 
+# Office locates optional payload (proofing tools, converters, add-ins) through MSI component
+# registrations that the Click-to-Run integrator writes on Windows; under Wine that step leaves the
+# App-V registry hives empty and Word reports "missing proofing tools" with every file on disk.
+# Rebuild them from the per-package manifests Click-to-Run keeps in ProgramData.
+register_msi_components() {
+  local root; root="$(win_prefix_root)"
+  local c2r="$root/drive_c/ProgramData/Microsoft/ClickToRun"
+  ls -d "$c2r"/\{*\} >/dev/null 2>&1 || { log "no Click-to-Run package data yet, skipping MSI component registration"; return 0; }
+  local reg="$MS365_HOME/msi-components.reg"
+  log "Registering Office MSI components (proofing tools, converters)"
+  python3 "$MS365_MSI_COMPONENTS" "$root/drive_c" "$reg" || return 0
+  umu regedit /S "$reg"
+  printf '%s' "$MSI_COMPONENTS_REV" > "$MS365_PREFIX/.ms365-msi-components"
+}
+MSI_COMPONENTS_REV=1
+
 post_install_fixups() {
   mirror_vfs
+  register_msi_components
   # 64-bit analogue of the classic ruados/eylenburg fix: the app-v subsystem DLLs must sit next
   # to the Office binaries or WINWORD etc. die on startup under Wine.
   local bits="$MS365_EDITION"
@@ -397,6 +425,7 @@ cmd_run() {
   fi
   # registry tweaks added after the prefix was installed
   if [ "$(cat "$MS365_PREFIX/.ms365-registry" 2>/dev/null)" != "$REGISTRY_REV" ]; then apply_registry; fi
+  if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
   if [ "$MS365_EDITION" = 64 ]; then
@@ -487,6 +516,8 @@ Environment (all optional):
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
+  MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
+  MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
   MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)
   UMU_LOG=debug   verbose umu output
 USG
