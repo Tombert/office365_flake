@@ -53,6 +53,8 @@ All optional, all environment variables:
 | `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
 | `MS365_D2D_SYNC` | `1` | `0` turns off the ole32 shim's GPU wait after every Direct2D `EndDraw` (see the ribbon row below) |
 | `MS365_TRACE_MODULE` | unset | debugging: the shim logs every export lookup into this DLL and every failed lookup (`MS365_DEBUG=1` to see them) |
+| `MS365_WAYLAND` | `0` | `1` runs Wine's Wayland driver instead of X11/Xwayland. Popup menus then stay open under sway and other wlroots compositors; see "Known problems" for what breaks |
+| `MS365_DPI` | unset | Wine dpi. Unset: 96, or 96 × the focused sway output's scale with `MS365_WAYLAND=1` |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -148,6 +150,17 @@ on Wine's `JsonValue`).
   `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to
   MSGR*.LEX, hyphenation and thesaurus split between engine DLL and lexicon). Spelling works; if
   hyphenation or the thesaurus (Shift+F7) refuse a language, those two mappings are the suspects.
+* **Right-click and other popup menus close immediately under sway** (X11 driver, the default).
+  Office activates its popup, hides and re-shows it while positioning it, and sway's Xwayland layer
+  moves keyboard focus back to the main window in between; Wine then sends Office the message that
+  cancels the menu. `MS365_WAYLAND=1` avoids it (Wine's Wayland driver keeps focus inside Wine).
+* **The Wayland driver of GE-Proton 11 (Wine 11.0) is not ready for 2x outputs.** It renders at
+  physical pixels, reports the monitor at 96 dpi (tiny UI unless `MS365_DPI` raises it), declares the
+  window geometry in pixels but the viewport in logical units (input a few characters off, and once
+  Office's window outgrows the logical screen, at 168/180 dpi, sway stops delivering input at all),
+  crashes Office at exactly 192 dpi, and sometimes gets disconnected for committing a surface before
+  its configure. 144 dpi works. Wine reworked all of this after 11.0; unlike d2d1 the display driver
+  cannot be taken from a newer Wine. Revisit when GE-Proton moves past Wine 11.0.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
   GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the
