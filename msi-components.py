@@ -10,8 +10,12 @@ carry everything the lookups need, so this script turns them into a .reg file fo
 * Components (MsiGetComponentPath): UserData\S-1-5-18\Components\<squished component id>, one value
   per product code (Office passes the App-V package id as the product, the descriptors below carry
   the package's own ProductCode, so both are registered) holding the component's key path.
-* Products (the install-state check in MsiGetComponentPath): UserData\...\Products\<squished
-  product>\InstallProperties with WindowsInstaller=1.
+* Products: UserData\...\Products\<squished product>\InstallProperties with WindowsInstaller=1 (the
+  install-state check in MsiGetComponentPath) and Software\Classes\Installer\Products\<squished
+  product> (MsiGetProductCode validates every product that registered a component against it).
+* Features (MsiQueryFeatureState, which Office runs on e.g. OfficeMSProof6 before it trusts the
+  proofing host): Software\Classes\Installer\Features\<product> naming the parent feature, and
+  UserData\...\Products\<product>\Features holding the feature's components in base85.
 * Qualified components (MsiEnumComponentQualifiers / MsiProvideQualifiedComponent): the
   PublishComponent entries. Office enumerates e.g. the speller category to learn which languages
   have proofing tools, then asks for the file behind a category and language. The value lives under
@@ -152,39 +156,59 @@ def multi_sz(strings):
     return "hex(7):" + ",\\\n  ".join(chunks)
 
 
-comp_re = re.compile(r'<Component\s+ComponentId="\{([0-9A-Fa-f-]+)\}"\s+KeyPath="([^"]*)"')
-feat_re = re.compile(r'<Feature FeatureId="([^"]+)"[^>]*>(.*?)</Feature>', re.S)
-pub_re = re.compile(r'<PublishComponent PublishComponentId="([^"]+)" Qualifier="([^"]*)" AppData="([^"]*)" Feature="([^"]*)"')
+attr_re = re.compile(r'([A-Za-z]+)="([^"]*)"')
+feat_re = re.compile(r'<Feature ([^>]*)>(.*?)</Feature>', re.S)
+
+
+def elements(text, tag):
+    """Attribute dicts of every <tag ...> element, whatever the attribute order."""
+    for m in re.finditer(r'<%s\s([^>]*?)/?>' % tag, text):
+        yield {k: html.unescape(v) for k, v in attr_re.findall(m.group(1))}
+
+
+def feature_tree(text):
+    """feature id -> (parent id, [component ids])"""
+    tree = {}
+    for attrs, body in feat_re.findall(text):
+        a = dict(attr_re.findall(attrs))
+        tree[a.get("FeatureId", "")] = (a.get("Parent", ""), ["{%s}" % c.upper() for c in re.findall(r'ComponentId="\{([0-9A-Fa-f-]+)\}"', body)])
+    return tree
 
 components = {}   # component id -> {product codes} ; path in comp_path
 comp_path = {}
 reg_keys = set()
-products = {pkg_id.upper()}
+products = {pkg_id.upper(): "Microsoft 365 (Click-to-Run package)"}
+features = {}     # product -> feature -> (parent, [component ids])
 qualified = {}    # category -> {qualifier: [descriptor strings]}
 
 for manifest in sorted(glob.glob(os.path.join(pkg_dir, "C2RManifest.*.xml"))):
     text = read_manifest(manifest)
     m = re.search(r'ProductCode="\{([0-9A-Fa-f-]+)\}"', text)
     product = m.group(1).upper() if m else pkg_id.upper()
-    products.add(product)
+    products.setdefault(product, os.path.basename(manifest)[len("C2RManifest."):-len(".xml")])
     comps = {}
-    for comp, keypath in comp_re.findall(text):
-        keypath = html.unescape(keypath)
-        comps["{%s}" % comp.upper()] = keypath
+    for a in elements(text, "Component"):
+        if "KeyPath" not in a:
+            continue
+        comp, keypath = a["ComponentId"].upper(), a["KeyPath"]
+        comps[comp] = keypath
         path = resolve(keypath)
         if path:
-            comp_path.setdefault(comp.upper(), path)
-            components.setdefault(comp.upper(), set()).update({pkg_id.upper(), product})
+            comp_path.setdefault(comp.strip("{}"), path)
+            components.setdefault(comp.strip("{}"), set()).update({pkg_id.upper(), product})
         else:
             rk = reg_keypath(keypath)
             if rk:
                 reg_keys.add(rk)
-    features = {}
-    for fid, body in feat_re.findall(text):
-        features[fid] = ["{%s}" % c.upper() for c in re.findall(r'ComponentId="\{([0-9A-Fa-f-]+)\}"', body)]
-    for category, qualifier, appdata, feature in pub_re.findall(text):
-        qualifier, appdata = html.unescape(qualifier), html.unescape(appdata)
-        comp = choose_component(category, features.get(feature, []), comps)
+    tree = feature_tree(text)
+    for fid, (parent, clist) in tree.items():
+        clist = [c for c in clist if c.strip("{}") in comp_path]
+        features.setdefault(product, {})[fid] = (parent, clist)
+        merged = features.setdefault(pkg_id.upper(), {}).setdefault(fid, (parent, []))
+        merged[1].extend(c for c in clist if c not in merged[1])
+    for a in elements(text, "PublishComponent"):
+        category, qualifier, appdata, feature = a["PublishComponentId"], a.get("Qualifier", ""), a.get("AppData", ""), a.get("Feature", "")
+        comp = a["ComponentId"].upper() if a.get("ComponentId") else choose_component(category, tree.get(feature, ("", []))[1], comps)
         if not comp or comp.strip("{}") not in comp_path:
             continue
         desc = base85(product) + feature + ">" + base85(comp) + appdata
@@ -192,10 +216,22 @@ for manifest in sorted(glob.glob(os.path.join(pkg_dir, "C2RManifest.*.xml"))):
 
 base = r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18"
 lines = ["Windows Registry Editor Version 5.00", ""]
-for prod in sorted(products):
+for prod, name in sorted(products.items()):
     lines += ["[%s\\Products\\%s\\InstallProperties]" % (base, squish(prod)),
               '"WindowsInstaller"=dword:00000001',
-              '"InstallLocation"="%s"' % office_root.replace("\\", "\\\\"), ""]
+              '"InstallLocation"="%s"' % office_root.replace("\\", "\\\\"),
+              '"DisplayName"="%s"' % name, "",
+              r"[HKEY_LOCAL_MACHINE\Software\Classes\Installer\Products\%s]" % squish(prod),
+              '"ProductName"="%s"' % name, ""]
+    feats = features.get(prod, {})
+    if feats:
+        lines.append(r"[HKEY_LOCAL_MACHINE\Software\Classes\Installer\Features\%s]" % squish(prod))
+        lines += ['"%s"="%s"' % (reg_name(f), reg_name(parent)) for f, (parent, _) in sorted(feats.items())]
+        lines += ["", "[%s\\Products\\%s\\Features]" % (base, squish(prod))]
+        for f, (parent, clist) in sorted(feats.items()):
+            data = "".join(base85(c) for c in clist) + ("\x02" + parent if parent else "")
+            lines.append('"%s"=%s' % (reg_name(f), ('"%s"' % reg_name(data)) if "\x02" not in data else "hex(1):" + ",".join("%02x" % b for b in (data + "\0").encode("latin-1"))))
+        lines.append("")
 for comp, prods in sorted(components.items()):
     lines.append("[%s\\Components\\%s]" % (base, squish(comp)))
     for prod in sorted(prods):
@@ -210,5 +246,5 @@ for rk in sorted(reg_keys):
     lines += ["[%s]" % rk, ""]
 with open(out, "w", newline="\r\n") as f:
     f.write("\n".join(lines))
-print("%d components, %d products, %d qualified-component categories, %d registry keys for package {%s} -> %s"
-      % (len(components), len(products), len(qualified), len(reg_keys), pkg_id, out))
+print("%d components, %d products, %d features, %d qualified-component categories, %d registry keys for package {%s} -> %s"
+      % (len(components), len(products), sum(len(f) for f in features.values()), len(qualified), len(reg_keys), pkg_id, out))
