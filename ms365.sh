@@ -156,6 +156,20 @@ Windows Registry Editor Version 5.00
 "DisableAADWAM"=dword:00000001
 "DisableMSAWAM"=dword:00000001
 "DisableOneAuth"=dword:00000000
+
+; The OneAuth stack honours these only from the Group Policy hives; without them personal
+; (MSA) accounts still go to WAM after home-realm discovery and fail with 0x80040154.
+[HKEY_CURRENT_USER\Software\Policies\Microsoft\Office\16.0\Common\Identity]
+"EnableADAL"=dword:00000001
+"DisableADALatopWAMOverride"=dword:00000001
+"DisableAADWAM"=dword:00000001
+"DisableMSAWAM"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\Software\Policies\Microsoft\Office\16.0\Common\Identity]
+"EnableADAL"=dword:00000001
+"DisableADALatopWAMOverride"=dword:00000001
+"DisableAADWAM"=dword:00000001
+"DisableMSAWAM"=dword:00000001
 REG
   if [ "${MS365_SCA:-1}" != 0 ]; then
     cat >> "$reg" <<'REG'
