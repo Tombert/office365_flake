@@ -50,6 +50,7 @@ All optional, all environment variables:
 | `MS365_WINETRICKS` | `corefonts msxml6 riched20 gdiplus` | Verbs applied before install |
 | `MS365_ODT_SETUP` | unset | Use a local ODT `setup.exe` instead of downloading the current one |
 | `MS365_SCA` | `0` | `1` switches to Shared Computer Activation (business subscriptions only) instead of vNext token licensing |
+| `MS365_RADV_DEBUG` | `nodcc,nohiz,nofmask,syncshaders` | AMD driver flags the launcher exports as `RADV_DEBUG`; set to an empty string to disable |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -93,6 +94,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
+| Ribbon font/size/style boxes, Share/Editing buttons and the search field are grey blocks until hovered (AMD GPUs) | Office draws those controls through Direct2D into Direct3D textures shared between two devices; with RADV the compositor reads an empty copy. The launcher sets `RADV_DEBUG=nodcc,nohiz,nofmask,syncshaders` (override with `MS365_RADV_DEBUG`) |
 | "Missing proofing tools" banner although the dictionaries are installed | Office finds proofing engines through MSI component registrations the Click-to-Run integrator never wrote under Wine; `msi-components.py` rebuilds them from the package manifests |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`

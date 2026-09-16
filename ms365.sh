@@ -44,6 +44,14 @@ umu_env() {
   export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"  # don't spam .desktop files
   # Office wants an X11 surface; GE-Proton 11 ships winewayland too, prefer X11 unless overridden.
   export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
+  # Office renders its ribbon text controls (font/size/style boxes, Share/Editing, search) through
+  # Direct2D into Direct3D textures shared between two devices. On AMD (RADV) the compositor then
+  # reads an empty copy and those controls show as grey blocks until hovered. Disabling the driver's
+  # image compression and forcing shader synchronisation fixes it; other drivers ignore the variable.
+  # MS365_RADV_DEBUG overrides (empty string = leave the driver defaults).
+  if [ -z "${RADV_DEBUG:-}" ]; then
+    export RADV_DEBUG="${MS365_RADV_DEBUG-nodcc,nohiz,nofmask,syncshaders}"
+  fi
   mkdir -p "$MS365_PREFIX" "$LOG_DIR"
   # MS365_DEBUG=1 turns on Proton's wine log (+seh etc.) -> $LOG_DIR/steam-<appid>.log
   # MS365_WINEDEBUG replaces Proton's default channel list, e.g. "+timestamp,+pid,+tid,+debugstr,+reg"
@@ -516,6 +524,7 @@ Environment (all optional):
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
+  MS365_RADV_DEBUG=<flags>  AMD driver debug flags (default nodcc,nohiz,nofmask,syncshaders; set empty to disable)
   MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
   MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
   MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)
