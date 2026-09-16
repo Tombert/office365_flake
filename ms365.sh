@@ -350,12 +350,12 @@ register_msi_components() {
   local c2r="$root/drive_c/ProgramData/Microsoft/ClickToRun"
   ls -d "$c2r"/\{*\} >/dev/null 2>&1 || { log "no Click-to-Run package data yet, skipping MSI component registration"; return 0; }
   local reg="$MS365_HOME/msi-components.reg"
-  log "Registering Office MSI components (proofing tools, converters)"
+  log "Registering Office MSI components and qualified components (proofing tools, converters)"
   python3 "$MS365_MSI_COMPONENTS" "$root/drive_c" "$reg" || return 0
   umu regedit /S "$reg"
   printf '%s' "$MSI_COMPONENTS_REV" > "$MS365_PREFIX/.ms365-msi-components"
 }
-MSI_COMPONENTS_REV=1
+MSI_COMPONENTS_REV=2   # 2: qualified components (proofing tool categories), per-package product codes
 
 post_install_fixups() {
   mirror_vfs
