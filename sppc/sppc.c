@@ -58,10 +58,30 @@ static void trace2(const char *fn, const SLID *a, const SLID *b, PCWSTR name, HR
 }
 #define TRACE_RET(fn, a, b, name, hr) do { HRESULT _hr = (hr); trace2(fn, a, b, name, _hr); return _hr; } while (0)
 
+/* ---- behaviour mode (MS365_SPPC_MODE env var, read once) ------------------
+ *  0 (default): queries fail with SL_E_VALUE_NOT_FOUND, rights are not granted
+ *  1: like 0 but SLGetLicensingStatusInformation succeeds with an empty status list
+ *  2: emulate a machine whose Software Protection service is stopped: every call
+ *     fails with HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) */
+#define E_SVC_UNAVAILABLE ((HRESULT)0x800706BA)
+static int mode = -1;
+static int get_mode(void)
+{
+    if (mode < 0) {
+        char buf[16] = "";
+        DWORD n = GetEnvironmentVariableA("MS365_SPPC_MODE", buf, sizeof(buf));
+        mode = (n > 0 && n < sizeof(buf)) ? (buf[0] - '0') : 0;
+        if (mode < 0 || mode > 2) mode = 0;
+        char msg[64]; wsprintfA(msg, "sppc shim: mode %d", mode); OutputDebugStringA(msg);
+    }
+    return mode;
+}
+
 /* ---- session ---------------------------------------------------------- */
 API SLOpen(HSLC *handle)
 {
     if (!handle) return E_INVALIDARG;
+    if (get_mode() == 2) { OutputDebugStringA("sppc shim: SLOpen -> service unavailable"); return E_SVC_UNAVAILABLE; }
     *handle = (HSLC)(ULONG_PTR)0x534c4f50; /* 'SLOP' */
     return S_OK;
 }
@@ -98,6 +118,8 @@ API SLGetLicensingStatusInformation(HSLC h, const SLID *app, const SLID *product
     (void)h;
     if (count) *count = 0;
     if (status) *status = NULL;
+    if (get_mode() == 2) TRACE_RET("SLGetLicensingStatusInformation", app, product, right, E_SVC_UNAVAILABLE);
+    if (get_mode() == 1) TRACE_RET("SLGetLicensingStatusInformation", app, product, right, S_OK);
     TRACE_RET("SLGetLicensingStatusInformation", app, product, right, SL_E_RIGHT_NOT_CONSUMED); /* same as Wine's builtin */
 }
 API SLGetSLIDList(HSLC h, int qtype, const SLID *qid, int rtype, UINT *count, SLID **ids)
@@ -160,7 +182,7 @@ API SLGatherMigrationBlobEx(BOOL migratable, BOOL user, UINT *size, PBYTE data)
 
 /* rights: never granted through SPP, so Office asks its own (vNext) licensing */
 API SLConsumeRight(HSLC h, const SLID *app, const SLID *product, PCWSTR right, void *reserved)
-{ (void)h; (void)reserved; TRACE_RET("SLConsumeRight", app, product, right, SL_E_RIGHT_NOT_GRANTED); }
+{ (void)h; (void)reserved; TRACE_RET("SLConsumeRight", app, product, right, get_mode() == 2 ? E_SVC_UNAVAILABLE : SL_E_RIGHT_NOT_GRANTED); }
 
 API SLIsGenuineLocalEx(const SLID *app, const SLID *alt, int *state)
 { (void)app; (void)alt; if (state) *state = 0 /* SL_GEN_STATE_IS_GENUINE */; return S_OK; }
