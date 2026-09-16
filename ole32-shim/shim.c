@@ -18,11 +18,7 @@
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
-#include <d3d11.h>
-#include <d3d11_1.h>
-#include <dwrite.h>
 #include <msi.h>
-#include <d2d1_1.h>
 typedef LPVOID HINTERNET;
 #include <winternl.h>
 #include <string.h>
@@ -179,7 +175,7 @@ static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
         const struct patch *w = p ? wrapped_lookup(h, name) : NULL;
         if (w) return (FARPROC)w->repl;
     } else if (name && p) {
-        /* ordinal lookups into wrapped modules (delay-loaded d2d1) */
+        /* ordinal lookups into wrapped modules (Office links msi.dll by ordinal) */
         const struct patch *w = wrapped_lookup_ordinal(h, (WORD)(ULONG_PTR)name);
         if (w) return (FARPROC)w->repl;
     }
@@ -452,104 +448,6 @@ static HRESULT WINAPI my_RoGetActivationFactory(HSTRING cls, REFIID iid, void **
 }
 
 
-/* ---- Direct2D -> Direct3D GPU ordering ------------------------------------------------------
- * Office draws its ribbon controls with Direct2D into a sprite atlas that a second Direct3D device
- * (its compositor) reads through a keyed mutex. Wine's d2d1 vtables are static, so patching EndDraw
- * once covers every device context: after the real EndDraw, wait until the GPU has finished with the
- * target, so the compositor never copies a sprite before it was drawn. Written while chasing the grey
- * ribbon controls, whose actual cause was the geometry-group fill-mode bug in Wine 11.0's d2d1 (the
- * launcher now ships a fixed d2d1.dll); kept as a cheap safety net. MS365_D2D_SYNC=0 disables. */
-typedef HRESULT (WINAPI *pD2D1CreateFactory)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS *, void **);
-typedef HRESULT (WINAPI *pD2D1CreateDevice)(IDXGIDevice *, const D2D1_CREATION_PROPERTIES *, ID2D1Device **);
-typedef HRESULT (WINAPI *pD3D11CreateDevice)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
-static pD2D1CreateFactory real_D2D1CreateFactory;
-static pD2D1CreateDevice real_D2D1CreateDevice;
-static HRESULT (STDMETHODCALLTYPE *orig_d2d_EndDraw)(ID2D1DeviceContext *, D2D1_TAG *, D2D1_TAG *);
-static LONG d2d_patched;
-static int g_d2d_sync = 1;
-static LONG d2d_sync_count;
-static void d2d_gpu_sync(ID2D1DeviceContext *ctx)
-{
-    struct ID2D1Image *img = NULL; ID2D1Bitmap1 *bmp = NULL; IDXGISurface *surf = NULL;
-    ID3D11Device *dev = NULL; ID3D11DeviceContext *dc = NULL; ID3D11Query *q = NULL;
-    ID2D1DeviceContext_GetTarget(ctx, &img);
-    if (!img) return;
-    if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)img, &IID_ID2D1Bitmap1, (void **)&bmp))
-        && SUCCEEDED(ID2D1Bitmap1_GetSurface(bmp, &surf))
-        && SUCCEEDED(IDXGISurface_GetDevice(surf, &IID_ID3D11Device, (void **)&dev))) {
-        D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
-        ID3D11Device_GetImmediateContext(dev, &dc);
-        if (dc && SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &q))) {
-            BOOL done = FALSE; int spins = 0;
-            ID3D11DeviceContext_End(dc, (ID3D11Asynchronous *)q);
-            ID3D11DeviceContext_Flush(dc);
-            while (ID3D11DeviceContext_GetData(dc, (ID3D11Asynchronous *)q, &done, sizeof(done), 0) == S_FALSE && spins++ < 2000000)
-                Sleep(0);
-            if (InterlockedIncrement(&d2d_sync_count) == 1) OutputDebugStringA("ms365 ole32 shim: Direct2D EndDraw GPU sync active");
-        }
-    }
-    if (q) ID3D11Query_Release(q);
-    if (dc) ID3D11DeviceContext_Release(dc);
-    if (dev) ID3D11Device_Release(dev);
-    if (surf) IDXGISurface_Release(surf);
-    if (bmp) IUnknown_Release((IUnknown *)bmp);
-    IUnknown_Release((IUnknown *)img);
-}
-
-static HRESULT STDMETHODCALLTYPE my_d2d_EndDraw(ID2D1DeviceContext *ctx, D2D1_TAG *tag1, D2D1_TAG *tag2)
-{
-    HRESULT hr = orig_d2d_EndDraw(ctx, tag1, tag2);
-    if (g_d2d_sync) d2d_gpu_sync(ctx);
-    return hr;
-}
-static void patch_d2d_from_device(ID2D1Device *d2ddev)
-{
-    ID2D1DeviceContext *ctx = NULL;
-    if (InterlockedCompareExchange(&d2d_patched, 1, 0)) return;
-    if (FAILED(ID2D1Device_CreateDeviceContext(d2ddev, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &ctx)) || !ctx) { d2d_patched = 0; return; }
-    ID2D1DeviceContextVtbl *vt = (ID2D1DeviceContextVtbl *)ctx->lpVtbl;
-    DWORD old;
-    if (VirtualProtect(&vt->Base.EndDraw, sizeof(void *), PAGE_READWRITE, &old)) {
-        orig_d2d_EndDraw = (void *)vt->Base.EndDraw;
-        vt->Base.EndDraw = (void *)my_d2d_EndDraw;
-        VirtualProtect(&vt->Base.EndDraw, sizeof(void *), old, &old);
-        OutputDebugStringA("ms365 ole32 shim: patched Direct2D EndDraw");
-    } else d2d_patched = 0;
-    IUnknown_Release((IUnknown *)ctx);
-}
-static void patch_d2d_from_factory(ID2D1Factory *factory)
-{
-    ID2D1Factory1 *f1 = NULL; ID3D11Device *dev = NULL; IDXGIDevice *dxgi = NULL; ID2D1Device *d2ddev = NULL;
-    if (d2d_patched) return;
-    if (FAILED(IUnknown_QueryInterface((IUnknown *)factory, &IID_ID2D1Factory1, (void **)&f1))) return;
-    HMODULE d3d = LoadLibraryA("d3d11.dll");
-    pD3D11CreateDevice create = d3d ? (pD3D11CreateDevice)real_GetProcAddress(d3d, "D3D11CreateDevice") : NULL;
-    if (create && SUCCEEDED(create(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, NULL))
-        && SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice, (void **)&dxgi))
-        && SUCCEEDED(ID2D1Factory1_CreateDevice(f1, dxgi, &d2ddev))) {
-        patch_d2d_from_device(d2ddev);
-    }
-    if (d2ddev) IUnknown_Release((IUnknown *)d2ddev);
-    if (dxgi) IDXGIDevice_Release(dxgi);
-    if (dev) ID3D11Device_Release(dev);
-    IUnknown_Release((IUnknown *)f1);
-}
-static HRESULT WINAPI my_D2D1CreateFactory(D2D1_FACTORY_TYPE type, REFIID riid, const D2D1_FACTORY_OPTIONS *opts, void **out)
-{
-    if (!real_D2D1CreateFactory) return E_NOTIMPL;
-    HRESULT hr = real_D2D1CreateFactory(type, riid, opts, out);
-    if (SUCCEEDED(hr) && out && *out && g_d2d_sync) patch_d2d_from_factory((ID2D1Factory *)*out);
-    return hr;
-}
-static HRESULT WINAPI my_D2D1CreateDevice(IDXGIDevice *dxgi, const D2D1_CREATION_PROPERTIES *props, ID2D1Device **out)
-{
-    if (!real_D2D1CreateDevice) return E_NOTIMPL;
-    HRESULT hr = real_D2D1CreateDevice(dxgi, props, out);
-    if (SUCCEEDED(hr) && out && *out && g_d2d_sync) patch_d2d_from_device(*out);
-    return hr;
-}
-
-
 /* ---- Windows Installer: empty product code = "whichever package owns it" ----------------------
  * Office validates its proofing host through msi.dll with an empty product code
  * (MsiQueryFeatureState("", "OfficeMSProof6"), MsiGetComponentPathEx("", msspell7 component)).
@@ -613,8 +511,6 @@ static const struct patch PATCHES[] = {
     { "wininet.dll",  "InternetQueryOptionW",        (void *)my_InternetQueryOptionW },
     { "wininet.dll",  "InternetQueryOptionA",        (void *)my_InternetQueryOptionA },
     { "combase.dll",  "RoGetActivationFactory",      (void *)my_RoGetActivationFactory },
-    { "d2d1.dll",     "D2D1CreateFactory",           (void *)my_D2D1CreateFactory },
-    { "d2d1.dll",     "D2D1CreateDevice",            (void *)my_D2D1CreateDevice },
     { "msi.dll",      "MsiQueryFeatureStateW",       (void *)my_MsiQueryFeatureStateW },
     { "msi.dll",      "MsiGetComponentPathExW",      (void *)my_MsiGetComponentPathExW },
     { "msi.dll",      "MsiGetComponentPathW",        (void *)my_MsiGetComponentPathW },
@@ -635,20 +531,13 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "wininet.dll", NULL },
     { "combase.dll", NULL },
     { "api-ms-win-core-winrt-l1-1-0.dll", NULL },
-    { "d2d1.dll", NULL },
     { "msi.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
-/* Office imports d2d1 and msi by ordinal (Windows' d2d1.dll exports D2D1CreateFactory as #1,
- * msi.dll MsiQueryFeatureStateW as #111); Wine uses the same ordinals. Map the ones we wrap back
- * to names. */
+/* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
+ * Wine's msi.spec keeps the same ordinals. Map the ones we wrap back to names. */
 static const char *ordinal_name(const char *dll, WORD ordinal)
 {
-    if (lstrcmpiA(dll, "d2d1.dll") == 0) {
-        if (ordinal == 1) return "D2D1CreateFactory";
-        if (ordinal == 7) return "D2D1CreateDevice";
-    }
-    /* Office links msi.dll by ordinal as well (Wine's msi.spec keeps Windows' ordinals) */
     if (lstrcmpiA(dll, "msi.dll") == 0) {
         if (ordinal == 111) return "MsiQueryFeatureStateW";
         if (ordinal == 173) return "MsiGetComponentPathW";
@@ -702,9 +591,6 @@ static void note_module(HMODULE h, const char *modname)
             real_InternetSetOptionA = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionA");
             real_InternetQueryOptionW = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionW");
             real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
-        } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
-            real_D2D1CreateFactory = (pD2D1CreateFactory)real_GetProcAddress(h, "D2D1CreateFactory");
-            real_D2D1CreateDevice = (pD2D1CreateDevice)real_GetProcAddress(h, "D2D1CreateDevice");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");
@@ -900,7 +786,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         real_GetProcAddress = (pGetProcAddress)GetProcAddress(k32, "GetProcAddress");
         real_GetModuleBaseNameA = (pGetModuleBaseNameA_t)GetProcAddress(k32, "K32GetModuleBaseNameA");
-        { char v[8]; if (GetEnvironmentVariableA("MS365_D2D_SYNC", v, sizeof(v)) && v[0] == '0') g_d2d_sync = 0; }
         GetEnvironmentVariableA("MS365_TRACE_MODULE", g_trace_mod_name, sizeof(g_trace_mod_name));
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         pLdrRegisterDllNotification reg = ntdll ? (pLdrRegisterDllNotification)GetProcAddress(ntdll, "LdrRegisterDllNotification") : NULL;
