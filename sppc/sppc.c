@@ -450,7 +450,7 @@ API SLOpen(HSLC *handle)
     *handle = (HSLC)(ULONG_PTR)0x534c4f50;
     return S_OK;
 }
-API SLClose(HSLC handle) { (void)handle; return S_OK; }
+API SLClose(HSLC handle) { (void)handle; tracef("sppc shim: SLClose"); return S_OK; }
 
 /* ---- licence installation ---------------------------------------------- */
 API SLInstallLicense(HSLC h, UINT cb, const BYTE *blob, SLID *file_id)
@@ -700,21 +700,21 @@ API SLInstallProofOfPurchase(HSLC h, PCWSTR alg, PCWSTR key, UINT cb, PBYTE data
 { (void)h; (void)alg; (void)cb; (void)data; if (pkey_id) memset(pkey_id, 0, sizeof(*pkey_id)); tracef("sppc shim: SLInstallProofOfPurchase %ls (refused)", key ? key : L""); return SL_E_VALUE_NOT_FOUND; }
 API SLInstallProofOfPurchaseEx(HSLC h, const SLID *app, PCWSTR alg, PCWSTR key, UINT cb, PBYTE data, SLID *pkey_id)
 { (void)h; (void)app; (void)alg; (void)cb; (void)data; if (pkey_id) memset(pkey_id, 0, sizeof(*pkey_id)); tracef("sppc shim: SLInstallProofOfPurchaseEx %ls (refused)", key ? key : L""); return SL_E_VALUE_NOT_FOUND; }
-API SLUninstallProofOfPurchase(HSLC h, const SLID *id) { (void)h; (void)id; return S_OK; }
-API SLSetCurrentProductKey(HSLC h, const SLID *sku, const SLID *pkey) { (void)h; (void)sku; (void)pkey; return SL_E_VALUE_NOT_FOUND; }
+API SLUninstallProofOfPurchase(HSLC h, const SLID *id) { (void)h; TRACE_RET("SLUninstallProofOfPurchase", id, NULL, NULL, S_OK); }
+API SLSetCurrentProductKey(HSLC h, const SLID *sku, const SLID *pkey) { (void)h; TRACE_RET("SLSetCurrentProductKey", sku, pkey, NULL, SL_E_VALUE_NOT_FOUND); }
 API SLGetPKeyId(HSLC h, PCWSTR alg, PCWSTR key, UINT cb, const BYTE *data, SLID *pkey_id)
-{ (void)h; (void)alg; (void)key; (void)cb; (void)data; if (pkey_id) memset(pkey_id, 0, sizeof(*pkey_id)); return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; (void)alg; (void)cb; (void)data; if (pkey_id) memset(pkey_id, 0, sizeof(*pkey_id)); TRACE_RET("SLGetPKeyId", NULL, NULL, key, SL_E_VALUE_NOT_FOUND); }
 API SLGetEncryptedPIDEx(HSLC h, const SLID *sku, UINT *size, PBYTE *data)
-{ (void)h; (void)sku; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetEncryptedPIDEx", sku, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
 API SLGetAuthenticationResult(HSLC h, UINT *size, PBYTE *data)
-{ (void)h; if (size) *size = 0; if (data) *data = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetAuthenticationResult", NULL, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
 API SLGenerateOfflineInstallationId(HSLC h, const SLID *sku, PWSTR *out)
-{ (void)h; (void)sku; if (out) *out = NULL; return SL_E_VALUE_NOT_FOUND; }
+{ (void)h; if (out) *out = NULL; TRACE_RET("SLGenerateOfflineInstallationId", sku, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
 API SLGenerateOfflineInstallationIdEx(HSLC h, const SLID *sku, const void *info, PWSTR *out)
-{ (void)h; (void)sku; (void)info; if (out) *out = NULL; return SL_E_VALUE_NOT_FOUND; }
-API SLGatherMigrationBlob(BOOL a, BOOL b, UINT *size, PBYTE data) { (void)a; (void)b; (void)data; if (size) *size = 0; return S_OK; }
-API SLGatherMigrationBlobEx(BOOL a, BOOL b, UINT *size, PBYTE data) { (void)a; (void)b; (void)data; if (size) *size = 0; return S_OK; }
-API SLIsGenuineLocalEx(const SLID *app, const SLID *alt, int *state) { (void)app; (void)alt; if (state) *state = 0; return S_OK; }
+{ (void)h; (void)info; if (out) *out = NULL; TRACE_RET("SLGenerateOfflineInstallationIdEx", sku, NULL, NULL, SL_E_VALUE_NOT_FOUND); }
+API SLGatherMigrationBlob(BOOL a, BOOL b, UINT *size, PBYTE data) { (void)a; (void)b; (void)data; if (size) *size = 0; TRACE_RET("SLGatherMigrationBlob", NULL, NULL, NULL, S_OK); }
+API SLGatherMigrationBlobEx(BOOL a, BOOL b, UINT *size, PBYTE data) { (void)a; (void)b; (void)data; if (size) *size = 0; TRACE_RET("SLGatherMigrationBlobEx", NULL, NULL, NULL, S_OK); }
+API SLIsGenuineLocalEx(const SLID *app, const SLID *alt, int *state) { if (state) *state = 0; TRACE_RET("SLIsGenuineLocalEx", app, alt, NULL, S_OK); }
 
 /* ---- policies / events: accept ------------------------------------------- */
 API SLLoadApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags, HSLP *handle)
@@ -727,12 +727,12 @@ API SLLoadApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags, HSL
     if (handle) *handle = (HSLP)(ULONG_PTR)0x534c504f;
     TRACE_RET("SLLoadApplicationPolicies", app, sku, NULL, S_OK);
 }
-API SLUnloadApplicationPolicies(HSLP handle, DWORD flags) { (void)handle; (void)flags; return S_OK; }
-API SLPersistApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags) { (void)app; (void)sku; (void)flags; return S_OK; }
-API SLRegisterEvent(HSLC h, PCWSTR name, const SLID *app, HANDLE event) { (void)h; (void)name; (void)app; (void)event; return S_OK; }
-API SLUnregisterEvent(HSLC h, PCWSTR name, const SLID *app, HANDLE event) { (void)h; (void)name; (void)app; (void)event; return S_OK; }
+API SLUnloadApplicationPolicies(HSLP handle, DWORD flags) { (void)handle; (void)flags; TRACE_RET("SLUnloadApplicationPolicies", NULL, NULL, NULL, S_OK); }
+API SLPersistApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags) { (void)flags; TRACE_RET("SLPersistApplicationPolicies", app, sku, NULL, S_OK); }
+API SLRegisterEvent(HSLC h, PCWSTR name, const SLID *app, HANDLE event) { (void)h; (void)event; TRACE_RET("SLRegisterEvent", app, NULL, name, S_OK); }
+API SLUnregisterEvent(HSLC h, PCWSTR name, const SLID *app, HANDLE event) { (void)h; (void)event; TRACE_RET("SLUnregisterEvent", app, NULL, name, S_OK); }
 
-#define OK_STUB(name) API name(void) { return S_OK; }
+#define OK_STUB(name) API name(void *a, void *b, void *c, void *d) { tracef("sppc shim: " #name "(%p, %p, %p, %p) -> S_OK", a, b, c, d); return S_OK; }
 OK_STUB(SLCallServer)
 OK_STUB(SLDepositMigrationBlob)
 OK_STUB(SLDepositOfflineConfirmationId)
