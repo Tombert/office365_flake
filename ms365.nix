@@ -12,6 +12,7 @@
 , sppcShim
 , ole32ShimGE
 , ole32ShimSoda
+, uiaShim
 }:
 
 let
@@ -34,7 +35,8 @@ let
       MS365_SPPC_SHIM=${sppcShim}/lib/wine/x86_64-windows/sppc.dll
       MS365_OLE32_SHIM_GE=${ole32ShimGE}/lib/wine/x86_64-windows/ole32.dll
       MS365_OLE32_SHIM_SODA=${ole32ShimSoda}/lib/wine/x86_64-windows/ole32.dll
-      export MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA
+      MS365_UIA_SHIM=${uiaShim}/lib/wine/x86_64-windows/ms365uia.dll
+      export MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM
       ${builtins.readFile ./ms365.sh}
     '';
   };

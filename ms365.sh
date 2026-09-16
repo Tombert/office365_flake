@@ -181,6 +181,7 @@ install_shims() {
   put_dll "$MS365_SPPC_SHIM" sppc.dll
   put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
   put_dll "$(ole32_shim_for_runner)" ole32.dll
+  put_dll "$MS365_UIA_SHIM" ms365uia.dll
   local reg="$ODT_DIR/shim-overrides.reg"
   mkdir -p "$ODT_DIR"
   cat > "$reg" <<'REG'
@@ -190,9 +191,19 @@ Windows Registry Editor Version 5.00
 "sppc"="native"
 "ole32"="native,builtin"
 
+; CLSID_CUIAutomationRegistrar: Wine's uiautomationcore has no class object for it and Office
+; dereferences the NULL result as soon as a document gets focus. ms365uia.dll (uia-shim/) provides it;
+; per-user Classes take precedence over Wine's HKLM registration.
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}]
+@="ms365 UIAutomationRegistrar"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}\InprocServer32]
+@="C:\\windows\\system32\\ms365uia.dll"
+"ThreadingModel"="Both"
+
 REG
   umu regedit /S "$reg"
-  printf 'sppc,ole32' > "$MS365_PREFIX/.ms365-shims"
+  printf 'sppc,ole32,uia' > "$MS365_PREFIX/.ms365-shims"
 }
 
 # Office keeps most of its DLLs under root/vfs/<KnownFolder>/... and relies on the App-V ISV layer to
@@ -317,6 +328,7 @@ cmd_run() {
     put_dll "$MS365_SPPC_SHIM" sppc.dll
     put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
     put_dll "$(ole32_shim_for_runner)" ole32.dll
+    put_dll "$MS365_UIA_SHIM" ms365uia.dll
   fi
   # Default switches: Word's /q skips the splash screen, whose thread trips a COM apartment
   # teardown race in Wine (null deref in combase) that takes the whole app down.

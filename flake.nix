@@ -44,11 +44,12 @@
       };
 
       sppcShim = pkgs.callPackage ./sppc { };
+      uiaShim = pkgs.callPackage ./uia-shim { };
       ole32ShimGE = pkgs.callPackage ./ole32-shim { runner = protonGE; runnerName = "ge"; };
       ole32ShimSoda = pkgs.callPackage ./ole32-shim { runner = protosoda; runnerName = "protosoda"; };
 
       ms365 = pkgs.callPackage ./ms365.nix {
-        inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda;
+        inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim;
       };
 
       mkApp = exe: { type = "app"; program = "${ms365}/bin/${exe}"; };
@@ -56,7 +57,7 @@
     {
       packages.${system} = {
         default = ms365;
-        inherit ms365 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda;
+        inherit ms365 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim;
       };
 
       apps.${system} = {
