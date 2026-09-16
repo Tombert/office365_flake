@@ -94,7 +94,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
-| Ribbon font/size/style boxes, Share/Editing buttons and the search field are grey blocks until hovered (AMD GPUs) | Office draws those controls through Direct2D into Direct3D textures shared between two devices; with RADV the compositor reads an empty copy. The launcher sets `RADV_DEBUG=nodcc,nohiz,nofmask,syncshaders` (override with `MS365_RADV_DEBUG`) |
+| Ribbon font/size/style boxes, Share/Editing buttons and the search field are grey blocks; hovering a control shows its text (AMD GPUs) | Not solved. Office draws those controls through Direct2D into Direct3D textures shared between two devices and, with DXVK on RADV, the compositor gets an empty copy; on wined3d the reverse controls fail. The launcher sets `RADV_DEBUG=nodcc,nohiz,nofmask,syncshaders` (override or clear with `MS365_RADV_DEBUG`), which rendered everything correctly in one session and not reliably since. See "Known problems" |
 | "Missing proofing tools" banner although the dictionaries are installed | Office finds proofing engines through MSI component registrations the Click-to-Run integrator never wrote under Wine; `msi-components.py` rebuilds them from the package manifests |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
@@ -138,6 +138,18 @@ again in Word.
 Other WinRT gaps the ole32 shim fills for the licensing code: `Windows.Globalization.Language`
 statics (`ILanguageStatics`) and `Windows.Data.Json.JsonObject` statics (`Parse`/`TryParse`, built
 on Wine's `JsonValue`).
+
+## Known problems
+
+* **Ribbon text controls render as grey blocks** (font name, size, style boxes, Share/Editing/Comments
+  buttons, the title-bar search field). Hovering a control draws it correctly; moving away greys it
+  again. Everything else in the ribbon draws. Findings so far: the controls are drawn by Direct2D
+  into Direct3D 11 textures shared between two devices; under DXVK the compositing device sees an
+  empty copy, under wined3d (`PROTON_USE_WINED3D=1`) those controls render but the classic ribbon
+  goes blank, and software rendering (Office's hardware-acceleration-off setting) gives an empty
+  window. Not caused by the Office theme, cloud fonts, feature flights, the MSI registrations or the
+  licensing mode (all tested). Full Vulkan synchronisation validation would pin it down; the Steam
+  runtime container does not accept a host-provided validation layer, so that is still open.
 
 ## Expectations
 
