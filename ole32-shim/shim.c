@@ -63,7 +63,34 @@ static BOOL WINAPI my_SetThreadpoolTimerEx(PTP_TIMER timer, PFILETIME due, DWORD
     return FALSE;
 }
 
+/* Wine's oleacc exports CreateStdAccessibleProxy{A,W} as aborting stubs. The proxy variant only
+ * differs from CreateStdAccessibleObject (which Wine implements) by naming the window class, so
+ * forward to that. Office's UI automation layer calls this once a document window is open. */
+typedef HRESULT (WINAPI *pCreateStdAccessibleObject)(HWND, LONG, REFIID, void **);
+static HRESULT WINAPI my_CreateStdAccessibleProxyW(HWND hwnd, LPCWSTR cls, LONG idObject, REFIID riid, void **ppv)
+{
+    (void)cls;
+    HMODULE m = GetModuleHandleA("oleacc.dll");
+    pCreateStdAccessibleObject fn = m ? (pCreateStdAccessibleObject)GetProcAddress(m, "CreateStdAccessibleObject") : NULL;
+    if (!fn) { if (ppv) *ppv = NULL; return E_NOTIMPL; }
+    return fn(hwnd, idObject, riid, ppv);
+}
+static HRESULT WINAPI my_CreateStdAccessibleProxyA(HWND hwnd, LPCSTR cls, LONG idObject, REFIID riid, void **ppv)
+{
+    (void)cls;
+    return my_CreateStdAccessibleProxyW(hwnd, NULL, idObject, riid, ppv);
+}
+
 struct patch { const char *dll; const char *fn; void *repl; };
+
+/* Exported stubs to overwrite in place (12-byte "mov rax, imm64; jmp rax") when their DLL loads.
+ * Unlike PATCHES these exist in the export table, but calling them aborts the process. */
+static const struct patch STUBPATCHES[] = {
+    { "oleacc.dll", "CreateStdAccessibleProxyW", (void *)my_CreateStdAccessibleProxyW },
+    { "oleacc.dll", "CreateStdAccessibleProxyA", (void *)my_CreateStdAccessibleProxyA },
+};
+#define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
@@ -116,6 +143,46 @@ static void patch_module(HMODULE h, const char *modname)
                 break;
             }
         }
+    }
+}
+
+/* Address of a named export, walking the table by hand (GetProcAddress hides Wine stubs). NULL for
+ * forwarders and missing names. */
+static BYTE *find_export(HMODULE h, const char *name)
+{
+    BYTE *base = (BYTE *)h;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress) return NULL;
+    IMAGE_EXPORT_DIRECTORY *ed = (IMAGE_EXPORT_DIRECTORY *)(base + dd.VirtualAddress);
+    DWORD *names = (DWORD *)(base + ed->AddressOfNames);
+    WORD *ords = (WORD *)(base + ed->AddressOfNameOrdinals);
+    DWORD *funcs = (DWORD *)(base + ed->AddressOfFunctions);
+    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+        if (strcmp((const char *)(base + names[i]), name) != 0) continue;
+        DWORD rva = funcs[ords[i]];
+        if (rva >= dd.VirtualAddress && rva < dd.VirtualAddress + dd.Size) return NULL;
+        return base + rva;
+    }
+    return NULL;
+}
+
+/* Overwrite exported stubs of one module (if it is in STUBPATCHES). */
+static void patch_stubs(HMODULE h, const char *modname)
+{
+    for (size_t i = 0; i < NSTUBPATCHES; i++) {
+        if (!ieq(modname, STUBPATCHES[i].dll)) continue;
+        BYTE *fn = find_export(h, STUBPATCHES[i].fn);
+        if (!fn) { dbg("stub export not found", modname, STUBPATCHES[i].fn); continue; }
+        if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) continue; /* done */
+        DWORD old;
+        if (!VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old)) { dbg("VirtualProtect failed", modname, STUBPATCHES[i].fn); continue; }
+        fn[0] = 0x48; fn[1] = 0xB8;                         /* mov rax, imm64 */
+        memcpy(fn + 2, &STUBPATCHES[i].repl, sizeof(void *));
+        fn[10] = 0xFF; fn[11] = 0xE0;                       /* jmp rax */
+        VirtualProtect(fn, 16, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 16);
+        dbg("patched stub", modname, STUBPATCHES[i].fn);
     }
 }
 
@@ -180,6 +247,7 @@ static void CALLBACK on_dll_notify(ULONG reason, const LDR_NOTIFY_DATA *data, vo
     if (data->BaseDllName && data->BaseDllName->Buffer)
         WideCharToMultiByte(CP_ACP, 0, data->BaseDllName->Buffer, data->BaseDllName->Length / 2, name, sizeof(name) - 1, NULL, NULL);
     patch_module((HMODULE)data->DllBase, name);
+    patch_stubs((HMODULE)data->DllBase, name);
 }
 
 typedef BOOL (WINAPI *pEnumProcessModules)(HANDLE, HMODULE *, DWORD, DWORD *);
@@ -200,6 +268,7 @@ static void patch_loaded_modules(void)
         char name[128] = "?";
         baseName(GetCurrentProcess(), mods[i], name, sizeof(name));
         patch_module(mods[i], name);
+        patch_stubs(mods[i], name);
     }
 }
 
