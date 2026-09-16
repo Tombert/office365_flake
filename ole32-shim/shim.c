@@ -148,9 +148,15 @@ static pGetProcAddress real_GetProcAddress;
 typedef DWORD (WINAPI *pGetModuleBaseNameA_t)(HANDLE, HMODULE, LPSTR, DWORD);
 static pGetModuleBaseNameA_t real_GetModuleBaseNameA;
 
+static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name);
 static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
 {
     FARPROC p = real_GetProcAddress(h, name);
+    if (name && ((ULONG_PTR)name >> 16) != 0) {
+        /* functions we wrap (see PATCHES) must be wrapped for dynamic lookups too */
+        const struct patch *w = p ? wrapped_lookup(h, name) : NULL;
+        if (w) return (FARPROC)w->repl;
+    }
     if (p || !name || ((ULONG_PTR)name >> 16) == 0) return p;   /* ordinal lookups pass through */
     char mod[128] = "";
     if (real_GetModuleBaseNameA) real_GetModuleBaseNameA(GetCurrentProcess(), h, mod, sizeof(mod));
@@ -220,6 +226,16 @@ static const struct patch PATCHES[] = {
     { "kernel32.dll", "SetThreadpoolTimerEx",        (void *)my_SetThreadpoolTimerEx },
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
+
+/* PATCHES entries that wrap an existing export (not GetProcAddress itself), keyed by module */
+static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name)
+{
+    static HMODULE winhttp; if (!winhttp) winhttp = GetModuleHandleA("winhttp.dll");
+    if (!winhttp || h != winhttp) return NULL;
+    for (size_t i = 0; i < NPATCHES; i++)
+        if (lstrcmpiA(PATCHES[i].dll, "winhttp.dll") == 0 && strcmp(PATCHES[i].fn, name) == 0) return &PATCHES[i];
+    return NULL;
+}
 
 /* ---- machinery --------------------------------------------------------------------------- */
 

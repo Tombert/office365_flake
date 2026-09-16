@@ -170,6 +170,30 @@ Windows Registry Editor Version 5.00
 "DisableADALatopWAMOverride"=dword:00000001
 "DisableAADWAM"=dword:00000001
 "DisableMSAWAM"=dword:00000001
+
+; Office feature gates (ExternalFeatureOverrides): OneAuth otherwise still hands personal (MSA)
+; accounts to the Web Account Manager "broker" after home-realm discovery, and hosts the sign-in
+; page in Wine's old Gecko-based browser control, which cannot run Microsoft's login pages.
+; With these, OneAuth uses the Edge WebView2 runtime (install it with: ms365 winetricks webview2).
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\word]
+"Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
+"Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\excel]
+"Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
+"Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\powerpoint]
+"Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
+"Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\outlook]
+"Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
+"Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\onenote]
+"Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth"="true"
+"Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled"="true"
 REG
   if [ "${MS365_SCA:-1}" != 0 ]; then
     cat >> "$reg" <<'REG'
