@@ -44,13 +44,9 @@ umu_env() {
   export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-winemenubuilder.exe=d}"  # don't spam .desktop files
   # Office wants an X11 surface; GE-Proton 11 ships winewayland too, prefer X11 unless overridden.
   export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
-  # Office renders its ribbon text controls (font/size/style boxes, Share/Editing, search) through
-  # Direct2D into Direct3D textures shared between two devices. On AMD (RADV) the compositor then
-  # reads an empty copy and those controls show as grey blocks until hovered. Disabling the driver's
-  # image compression and forcing shader synchronisation fixes it; other drivers ignore the variable.
-  # MS365_RADV_DEBUG overrides (empty string = leave the driver defaults).
-  if [ -z "${RADV_DEBUG:-}" ]; then
-    export RADV_DEBUG="${MS365_RADV_DEBUG-nodcc,nohiz,nofmask,syncshaders}"
+  # MS365_RADV_DEBUG sets RADV_DEBUG for the AMD driver (default: none).
+  if [ -z "${RADV_DEBUG:-}" ] && [ -n "${MS365_RADV_DEBUG:-}" ]; then
+    export RADV_DEBUG="$MS365_RADV_DEBUG"
   fi
   mkdir -p "$MS365_PREFIX" "$LOG_DIR"
   # MS365_DEBUG=1 turns on Proton's wine log (+seh etc.) -> $LOG_DIR/steam-<appid>.log
@@ -135,6 +131,7 @@ apply_tricks() {
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
 REGISTRY_REV=5
+SHIMS_REV=sppc,ole32,uia,d2d1   # bump when install_shims gains a DLL or an override
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
@@ -276,6 +273,7 @@ install_shims() {
   put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
   put_dll "$(ole32_shim_for_runner)" ole32.dll
   put_dll "$MS365_UIA_SHIM" ms365uia.dll
+  put_dll "$MS365_D2D1_DLL" d2d1.dll
   local reg="$ODT_DIR/shim-overrides.reg"
   mkdir -p "$ODT_DIR"
   cat > "$reg" <<'REG'
@@ -284,6 +282,9 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "sppc"="native"
 "ole32"="native,builtin"
+; d2d1-fix/: Direct2D from a newer Wine. Wine 11.0's d2d1 fills geometry groups without their fill
+; mode, which turns the ribbon controls' border rings into solid blocks that hide the text.
+"d2d1"="native"
 
 ; CLSID_CUIAutomationRegistrar: Wine's uiautomationcore has no class object for it and Office
 ; dereferences the NULL result as soon as a document gets focus. ms365uia.dll (uia-shim/) provides it;
@@ -304,7 +305,7 @@ Windows Registry Editor Version 5.00
 
 REG
   umu regedit /S "$reg"
-  printf 'sppc,ole32,uia' > "$MS365_PREFIX/.ms365-shims"
+  printf '%s' "$SHIMS_REV" > "$MS365_PREFIX/.ms365-shims"
 }
 
 # Office keeps most of its DLLs under root/vfs/<KnownFolder>/... and relies on the App-V ISV layer to
@@ -456,9 +457,11 @@ cmd_run() {
     put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
     put_dll "$(ole32_shim_for_runner)" ole32.dll
     put_dll "$MS365_UIA_SHIM" ms365uia.dll
-    # a prefix update rewrites Wine's own class registrations; put ours back when they are gone
-    if ! grep -aqF 'ms365uia' "$root/system.reg" 2>/dev/null; then
-      log "re-registering shim COM classes"
+    put_dll "$MS365_D2D1_DLL" d2d1.dll
+    # a prefix update rewrites Wine's own class registrations; put ours back when they are gone.
+    # Also re-run when this version added a DLL override the prefix does not have yet.
+    if ! grep -aqF 'ms365uia' "$root/system.reg" 2>/dev/null || [ "$(cat "$MS365_PREFIX/.ms365-shims" 2>/dev/null)" != "$SHIMS_REV" ]; then
+      log "re-registering shim DLL overrides and COM classes"
       install_shims
     fi
   fi
@@ -539,7 +542,7 @@ Environment (all optional):
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
-  MS365_RADV_DEBUG=<flags>  AMD driver debug flags (default nodcc,nohiz,nofmask,syncshaders; set empty to disable)
+  MS365_RADV_DEBUG=<flags>  AMD driver debug flags to export as RADV_DEBUG (default: none)
   MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
   MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
   MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)

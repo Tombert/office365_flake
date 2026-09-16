@@ -47,9 +47,11 @@
       uiaShim = pkgs.callPackage ./uia-shim { };
       ole32ShimGE = pkgs.callPackage ./ole32-shim { runner = protonGE; runnerName = "ge"; };
       ole32ShimSoda = pkgs.callPackage ./ole32-shim { runner = protosoda; runnerName = "protosoda"; };
+      # newer Direct2D for both runners' Wine 11.0 base (ribbon controls rendered as grey blocks)
+      d2d1Fix = pkgs.callPackage ./d2d1-fix { wine = pkgs.wine64Packages.unstable; };
 
       ms365 = pkgs.callPackage ./ms365.nix {
-        inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim;
+        inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
       };
 
       mkApp = exe: { type = "app"; program = "${ms365}/bin/${exe}"; };
@@ -57,7 +59,7 @@
     {
       packages.${system} = {
         default = ms365;
-        inherit ms365 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim;
+        inherit ms365 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
       };
 
       apps.${system} = {

@@ -50,7 +50,8 @@ All optional, all environment variables:
 | `MS365_WINETRICKS` | `corefonts msxml6 riched20 gdiplus` | Verbs applied before install |
 | `MS365_ODT_SETUP` | unset | Use a local ODT `setup.exe` instead of downloading the current one |
 | `MS365_SCA` | `0` | `1` switches to Shared Computer Activation (business subscriptions only) instead of vNext token licensing |
-| `MS365_RADV_DEBUG` | `nodcc,nohiz,nofmask,syncshaders` | AMD driver flags the launcher exports as `RADV_DEBUG`; set to an empty string to disable |
+| `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
+| `MS365_D2D_SYNC` | `1` | `0` turns off the ole32 shim's GPU wait after every Direct2D `EndDraw` (see the ribbon row below) |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -94,7 +95,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
-| Ribbon font/size/style boxes, Share/Editing buttons and the search field are grey blocks; hovering a control shows its text (AMD GPUs) | Not solved. Office draws those controls through Direct2D into Direct3D textures shared between two devices and, with DXVK on RADV, the compositor gets an empty copy; on wined3d the reverse controls fail. The launcher sets `RADV_DEBUG=nodcc,nohiz,nofmask,syncshaders` (override or clear with `MS365_RADV_DEBUG`), which rendered everything correctly in one session and not reliably since. See "Known problems" |
+| Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | Wine 11.0's `d2d1` ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. The shim's `EndDraw` GPU wait (`MS365_D2D_SYNC`) predates this finding and is kept as a safety net |
 | "Missing proofing tools" banner although the dictionaries are installed | Office finds proofing engines through MSI component registrations the Click-to-Run integrator never wrote under Wine; `msi-components.py` rebuilds them from the package manifests |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
@@ -141,15 +142,13 @@ on Wine's `JsonValue`).
 
 ## Known problems
 
-* **Ribbon text controls render as grey blocks** (font name, size, style boxes, Share/Editing/Comments
-  buttons, the title-bar search field). Hovering a control draws it correctly; moving away greys it
-  again. Everything else in the ribbon draws. Findings so far: the controls are drawn by Direct2D
-  into Direct3D 11 textures shared between two devices; under DXVK the compositing device sees an
-  empty copy, under wined3d (`PROTON_USE_WINED3D=1`) those controls render but the classic ribbon
-  goes blank, and software rendering (Office's hardware-acceleration-off setting) gives an empty
-  window. Not caused by the Office theme, cloud fonts, feature flights, the MSI registrations or the
-  licensing mode (all tested). Full Vulkan synchronisation validation would pin it down; the Steam
-  runtime container does not accept a host-provided validation layer, so that is still open.
+* **Proofing engine**: the "missing proofing tools" banner is gone (the MSI component registrations
+  are in place and the speller host loads), but the English speller engine itself is not picked up
+  yet, so spell checking stays off. Next on the list.
+* **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
+  GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
+  Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the
+  Proton base lacks, the launcher's log will show `d2d1` failing to load.
 
 ## Expectations
 
