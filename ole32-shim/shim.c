@@ -626,13 +626,20 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "msi.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
-/* Office imports d2d1 by ordinal (Windows' d2d1.dll exports D2D1CreateFactory as #1); Wine's
- * d2d1 uses the same ordinals. Map the ones we wrap back to names. */
+/* Office imports d2d1 and msi by ordinal (Windows' d2d1.dll exports D2D1CreateFactory as #1,
+ * msi.dll MsiQueryFeatureStateW as #111); Wine uses the same ordinals. Map the ones we wrap back
+ * to names. */
 static const char *ordinal_name(const char *dll, WORD ordinal)
 {
     if (lstrcmpiA(dll, "d2d1.dll") == 0) {
         if (ordinal == 1) return "D2D1CreateFactory";
         if (ordinal == 7) return "D2D1CreateDevice";
+    }
+    /* Office links msi.dll by ordinal as well (Wine's msi.spec keeps Windows' ordinals) */
+    if (lstrcmpiA(dll, "msi.dll") == 0) {
+        if (ordinal == 111) return "MsiQueryFeatureStateW";
+        if (ordinal == 173) return "MsiGetComponentPathW";
+        if (ordinal == 294) return "MsiGetComponentPathExW";
     }
     return NULL;
 }
