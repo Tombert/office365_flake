@@ -318,7 +318,12 @@ cmd_run() {
     put_dll "$(runner_path)/files/lib/wine/x86_64-windows/ole32.dll" ole32_wine.dll
     put_dll "$(ole32_shim_for_runner)" ole32.dll
   fi
-  exec umu-run "$path" "$@"
+  # Default switches: Word's /q skips the splash screen, whose thread trips a COM apartment
+  # teardown race in Wine (null deref in combase) that takes the whole app down.
+  local defargs=""
+  case "$app" in word) defargs="/q" ;; esac
+  # shellcheck disable=SC2086
+  exec umu-run "$path" ${MS365_APP_ARGS-$defargs} "$@"
 }
 
 cmd_winetricks() { umu_env; ensure_prefix; umu winetricks "$@"; }
@@ -389,6 +394,7 @@ Environment (all optional):
   MS365_ODT_SETUP path to a local ODT setup.exe instead of downloading
   MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
+  MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
   UMU_LOG=debug   verbose umu output
 USG
 }
