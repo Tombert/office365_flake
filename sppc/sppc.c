@@ -71,8 +71,11 @@ static void trace2(const char *fn, const SLID *a, const SLID *b, PCWSTR name, HR
 /* ---- licence store ------------------------------------------------------ */
 #define MAX_LIC 512
 #define MAX_IDS 8
+struct policy { char *name; int type; char *value; };   /* type: SL_DATA_DWORD / SL_DATA_SZ / SL_DATA_BINARY (base64 text) */
+
 struct lic {
     SLID   id;                 /* licenseId of the outer r:license */
+    struct policy *pol; int npol;   /* every <sl:policyInt|Str|Bin> in the licence */
     char   idstr[40];
     char   title[128];
     char   family[128];        /* Security-SPP-Reserved-Family, e.g. Office16O365ProPlusR_Subscription1 */
@@ -142,6 +145,45 @@ static int parse_license(const char *xml, size_t len, struct lic *L)
     if ((q = strstr(p, "name=\"Security-SPP-Reserved-Family\""))) {
         q = strchr(q, '>');
         if (q) copy_text(q + 1, "</sl:policyStr>", L->family, sizeof(L->family));
+    }
+    /* policy-definition licences (PPD) identify their SKU family through the editionId they apply to */
+    if (!L->family[0] && (q = strstr(p, "<editionId"))) {
+        const char *v = strstr(q, "value=\"");
+        if (v && v - q < 200) copy_text(v + 7, "\"", L->family, sizeof(L->family));
+    }
+    /* collect every <sl:policyInt|Str|Bin name="..."[ attributes=...]>value</sl:policy...> */
+    {
+        int cap = 0;
+        for (q = p; (q = strstr(q, "<sl:policy")); q++) {
+            int type;
+            if (!strncmp(q, "<sl:policyInt", 13)) type = SL_DATA_DWORD;
+            else if (!strncmp(q, "<sl:policyStr", 13)) type = SL_DATA_SZ;
+            else if (!strncmp(q, "<sl:policyBin", 13)) type = SL_DATA_BINARY;
+            else continue;
+            const char *nm = strstr(q, "name=\""), *gt = strchr(q, '>');
+            if (!nm || !gt || nm > gt) continue;
+            nm += 6;
+            const char *nme = strchr(nm, '"');
+            if (!nme || nme > gt) continue;
+            const char *ve = strstr(gt + 1, "</sl:policy");
+            if (!ve) continue;
+            if (L->npol >= cap) {
+                int ncap = cap ? cap * 2 : 64;
+                struct policy *np = (struct policy *)LocalAlloc(LMEM_FIXED | LMEM_ZEROINIT, ncap * sizeof(*np));
+                if (!np) break;
+                if (L->pol) { memcpy(np, L->pol, L->npol * sizeof(*np)); LocalFree(L->pol); }
+                L->pol = np; cap = ncap;
+            }
+            struct policy *P = &L->pol[L->npol];
+            size_t nl = (size_t)(nme - nm), vl = (size_t)(ve - gt - 1);
+            P->name = (char *)LocalAlloc(LMEM_FIXED, nl + 1);
+            P->value = (char *)LocalAlloc(LMEM_FIXED, vl + 1);
+            if (!P->name || !P->value) break;
+            memcpy(P->name, nm, nl); P->name[nl] = 0;
+            memcpy(P->value, gt + 1, vl); P->value[vl] = 0;
+            P->type = type;
+            L->npol++;
+        }
     }
     for (q = p; (q = strstr(q, "<sl:appId")); q++) {
         const char *g = strstr(q, "<sl:guid>");
@@ -309,6 +351,96 @@ static int name_is(PCWSTR name, const char *ascii)
     for (; *name && *ascii; name++, ascii++) if (*name != (WCHAR)*ascii) return 0;
     return !*name && !*ascii;
 }
+static int wname_to_ascii(PCWSTR w, char *out, size_t cap)
+{
+    size_t i = 0;
+    if (!w) { out[0] = 0; return 0; }
+    for (; w[i] && i + 1 < cap; i++) out[i] = (w[i] < 128) ? (char)w[i] : '?';
+    out[i] = 0;
+    return 1;
+}
+
+/* ---- policies (from the licences' <sl:policy*> elements) ---------------------
+ * Policies that apply to a SKU come from every licence that names that SKU id (ul-oob) or its
+ * family (PPD policy definitions, publishing licences). */
+static const struct policy *find_policy(const SLID *sku, const char *name)
+{
+    const struct lic *main_l = NULL;
+    for (int i = 0; i < nstore; i++)
+        if (lic_has_sku(&store[i], sku) && store[i].nskus && store[i].family[0]) { main_l = &store[i]; break; }
+    for (int i = 0; i < nstore; i++) {
+        const struct lic *L = &store[i];
+        int applies = (L->nskus && lic_has_sku(L, sku)) || (main_l && L->family[0] && !strcmp(L->family, main_l->family));
+        if (!applies) continue;
+        for (int k = 0; k < L->npol; k++) if (!strcmp(L->pol[k].name, name)) return &L->pol[k];
+    }
+    return NULL;
+}
+static DWORD parse_dword(const char *v)
+{
+    if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+        DWORD r = 0;
+        for (v += 2; *v; v++) { int h = hexval(*v); if (h < 0) break; r = r * 16 + h; }
+        return r;
+    }
+    return (DWORD)strtoul(v, NULL, 10);
+}
+static HRESULT ret_bin_b64(const char *b64, int *type, UINT *size, PBYTE *data)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = strlen(b64);
+    BYTE *out = (BYTE *)LocalAlloc(LMEM_FIXED, n * 3 / 4 + 4);
+    if (!out) return E_OUTOFMEMORY;
+    UINT o = 0; int val = 0, bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (b64[i] == '=') break;
+        const char *pp = strchr(tbl, b64[i]);
+        if (!pp) continue;
+        val = (val << 6) | (int)(pp - tbl); bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (BYTE)((val >> bits) & 0xff); }
+    }
+    if (type) *type = SL_DATA_BINARY;
+    if (size) *size = o;
+    if (data) *data = out; else LocalFree(out);
+    return S_OK;
+}
+static HRESULT ret_policy(const struct policy *P, int *type, UINT *size, PBYTE *data)
+{
+    if (P->type == SL_DATA_DWORD) return ret_dword(parse_dword(P->value), type, size, data);
+    if (P->type == SL_DATA_BINARY) return ret_bin_b64(P->value, type, size, data);
+    return ret_sz(P->value, type, size, data);
+}
+/* the SKU an application-policy handle refers to: the one given / consumed, else the grace SKU */
+static SLID policy_sku; static int policy_sku_set;
+static const SLID *current_sku(void)
+{
+    if (policy_sku_set) return &policy_sku;
+    for (int i = 0; i < nstore; i++)
+        if (is_grace_family(&store[i]) && store[i].nskus) { policy_sku = store[i].skus[0]; policy_sku_set = 1; return &policy_sku; }
+    return NULL;
+}
+static HRESULT policy_lookup(PCWSTR name, int *type, UINT *size, PBYTE *data)
+{
+    if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL;
+    char nm[200]; wname_to_ascii(name, nm, sizeof(nm));
+    HRESULT hr = SL_E_VALUE_NOT_FOUND;
+    EnterCriticalSection(&lock);
+    load_store();
+    const SLID *sku = current_sku();
+    if (sku && !strcmp(nm, "*")) {
+        /* enumerate: MULTI_SZ of every policy name that applies to the SKU */
+        const char *names[2048]; int n = 0;
+        for (int i = 0; i < nstore && n < 2048; i++)
+            for (int k = 0; k < store[i].npol && n < 2048; k++)
+                if (find_policy(sku, store[i].pol[k].name) == &store[i].pol[k]) names[n++] = store[i].pol[k].name;
+        hr = ret_multi_sz(names, n, type, size, data);
+    } else if (sku) {
+        const struct policy *P = find_policy(sku, nm);
+        if (P) hr = ret_policy(P, type, size, data);
+    }
+    LeaveCriticalSection(&lock);
+    return hr;
+}
 
 /* ---- session ------------------------------------------------------------ */
 API SLOpen(HSLC *handle)
@@ -433,10 +565,15 @@ API SLGetProductSkuInformation(HSLC h, const SLID *sku, PCWSTR name, int *type, 
     load_store();
     struct lic *L = sku_main_license(sku);
     if (L) {
+        char nm[200], pref[220];
+        wname_to_ascii(name, nm, sizeof(nm));
+        wsprintfA(pref, "office-%s", nm);
+        const struct policy *P = find_policy(sku, pref);
+        if (!P) P = find_policy(sku, nm);
         if (name_is(name, "Name"))        hr = ret_sz(L->family[0] ? L->family : L->title, type, size, data);
         else if (name_is(name, "Description")) hr = ret_sz(L->title, type, size, data);
-        else if (name_is(name, "Family") || name_is(name, "Security-SPP-Reserved-Family")) hr = ret_sz(L->family, type, size, data);
-        else if (name_is(name, "LicenseFamily")) hr = ret_sz(L->family, type, size, data);
+        else if (name_is(name, "Family") || name_is(name, "Security-SPP-Reserved-Family") || name_is(name, "LicenseFamily")) hr = ret_sz(L->family, type, size, data);
+        else if (P) hr = ret_policy(P, type, size, data);
     }
     LeaveCriticalSection(&lock);
     TRACE_RET("SLGetProductSkuInformation", sku, NULL, name, hr);
@@ -450,8 +587,12 @@ API SLGetLicenseInformation(HSLC h, const SLID *id, PCWSTR name, int *type, UINT
     load_store();
     struct lic *L = find_license(id);
     if (L) {
+        char nm[200]; wname_to_ascii(name, nm, sizeof(nm));
         if (name_is(name, "Name") || name_is(name, "Description")) hr = ret_sz(L->title, type, size, data);
         else if (name_is(name, "Family")) hr = ret_sz(L->family, type, size, data);
+        else for (int k = 0; k < L->npol && hr != S_OK; k++)
+            if (!strcmp(L->pol[k].name, nm) || (!strncmp(L->pol[k].name, "office-", 7) && !strcmp(L->pol[k].name + 7, nm)))
+                hr = ret_policy(&L->pol[k], type, size, data);
     }
     LeaveCriticalSection(&lock);
     TRACE_RET("SLGetLicenseInformation", id, NULL, name, hr);
@@ -484,11 +625,20 @@ API SLGetServiceInformation(HSLC h, PCWSTR name, int *type, UINT *size, PBYTE *d
     TRACE_RET("SLGetServiceInformation", NULL, NULL, name, hr);
 }
 API SLGetPolicyInformation(HSLP h, PCWSTR name, int *type, UINT *size, PBYTE *data)
-{ (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetPolicyInformation", NULL, NULL, name, SL_E_VALUE_NOT_FOUND); }
-API SLGetPolicyInformationDWORD(HSLP h, PCWSTR name, DWORD *out)
-{ (void)h; if (out) *out = 0; TRACE_RET("SLGetPolicyInformationDWORD", NULL, NULL, name, SL_E_VALUE_NOT_FOUND); }
+{ (void)h; TRACE_RET("SLGetPolicyInformation", NULL, NULL, name, policy_lookup(name, type, size, data)); }
 API SLGetApplicationPolicy(HSLP h, PCWSTR name, int *type, UINT *size, PBYTE *data)
-{ (void)h; if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetApplicationPolicy", NULL, NULL, name, SL_E_VALUE_NOT_FOUND); }
+{ (void)h; TRACE_RET("SLGetApplicationPolicy", NULL, NULL, name, policy_lookup(name, type, size, data)); }
+API SLGetPolicyInformationDWORD(HSLP h, PCWSTR name, DWORD *out)
+{
+    (void)h;
+    int type = 0; UINT size = 0; PBYTE data = NULL;
+    HRESULT hr = policy_lookup(name, &type, &size, &data);
+    if (hr == S_OK && type == SL_DATA_DWORD && size == sizeof(DWORD)) { if (out) *out = *(DWORD *)data; }
+    else if (hr == S_OK) hr = 0xC004F01E; /* SL_E_DATATYPE_MISMATCHED */
+    if (data) LocalFree(data);
+    if (hr != S_OK && out) *out = 0;
+    TRACE_RET("SLGetPolicyInformationDWORD", NULL, NULL, name, hr);
+}
 API SLGetGenuineInformation(const SLID *id, PCWSTR name, int *type, UINT *size, PBYTE *data)
 { if (type) *type = 0; if (size) *size = 0; if (data) *data = NULL; TRACE_RET("SLGetGenuineInformation", id, NULL, name, SL_E_VALUE_NOT_FOUND); }
 
@@ -536,7 +686,7 @@ API SLConsumeRight(HSLC h, const SLID *app, const SLID *sku, PCWSTR right, void 
         const struct lic *L = &store[i];
         if (!is_grace_family(L) || !lic_has_app(L, app) || !lic_has_sku(L, sku)) continue;
         for (int k = 0; k < L->nskus; k++)
-            if ((!sku || guid_eq(&L->skus[k], sku)) && grace_remaining_minutes(&L->skus[k], L->grace_days, 1)) { hr = S_OK; break; }
+            if ((!sku || guid_eq(&L->skus[k], sku)) && grace_remaining_minutes(&L->skus[k], L->grace_days, 1)) { hr = S_OK; policy_sku = L->skus[k]; policy_sku_set = 1; break; }
     }
     LeaveCriticalSection(&lock);
     TRACE_RET("SLConsumeRight", app, sku, right, hr);
@@ -567,7 +717,15 @@ API SLIsGenuineLocalEx(const SLID *app, const SLID *alt, int *state) { (void)app
 
 /* ---- policies / events: accept ------------------------------------------- */
 API SLLoadApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags, HSLP *handle)
-{ (void)flags; if (handle) *handle = (HSLP)(ULONG_PTR)0x534c504f; TRACE_RET("SLLoadApplicationPolicies", app, sku, NULL, S_OK); }
+{
+    (void)flags;
+    EnterCriticalSection(&lock);
+    load_store();
+    if (sku) { policy_sku = *sku; policy_sku_set = 1; }
+    LeaveCriticalSection(&lock);
+    if (handle) *handle = (HSLP)(ULONG_PTR)0x534c504f;
+    TRACE_RET("SLLoadApplicationPolicies", app, sku, NULL, S_OK);
+}
 API SLUnloadApplicationPolicies(HSLP handle, DWORD flags) { (void)handle; (void)flags; return S_OK; }
 API SLPersistApplicationPolicies(const SLID *app, const SLID *sku, DWORD flags) { (void)app; (void)sku; (void)flags; return S_OK; }
 API SLRegisterEvent(HSLC h, PCWSTR name, const SLID *app, HANDLE event) { (void)h; (void)name; (void)app; (void)event; return S_OK; }
