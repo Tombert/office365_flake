@@ -473,6 +473,15 @@ cmd_run() {
   local root; root="$(win_prefix_root)"
   local path="$root/drive_c/Program Files/Microsoft Office/root/Office16/$exe"
   [ -f "$path" ] || die "$exe not installed (expected $path). Run: ms365 install"
+  # Office holds ClickToRunPackageLocker at mode 000 (a Windows deny-ACL that Wine maps to no Unix
+  # permission bits) while it runs, and resets it on a clean exit. After a crash or a kill -- routine
+  # under Wine -- it is left at 000, and the next launch cannot open it, so Click-to-Run aborts with
+  # "Something went wrong" (0x5 / STATUS_ACCESS_DENIED on the locker). Heal it before every start.
+  local locker="$root/drive_c/ProgramData/Microsoft/Office/ClickToRunPackageLocker"
+  if [ -f "$locker" ] && [ ! -r "$locker" ]; then
+    log "restoring ClickToRunPackageLocker permissions (left locked by an unclean exit)"
+    chmod u+rwx,g+rwx "$locker" 2>/dev/null || true
+  fi
   # After a crash Office offers "safe mode" via a modal prompt on the next start. Crashes are a fact
   # of life under Wine, so clear that flag unless MS365_KEEP_SAFEMODE_PROMPT=1. Only spend an extra
   # umu round-trip when the key is actually present in the hive.
