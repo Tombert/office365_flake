@@ -22,8 +22,9 @@ carry everything the lookups need, so this script turns them into a .reg file fo
   Software\Classes\Installer\Components\<squished category id>, named by the qualifier, as a
   REG_MULTI_SZ descriptor "<product code base85><feature>><component base85><app data>".
   The manifests do not say which of a feature's components a category refers to; ROLE picks it by
-  file role (speller category -> MSSP*.LEX, ProofDataFile -> CSS7DATA*.DLL, ...). Unmatched
-  categories get the feature's first file component.
+  file role (speller category -> MSSP*.LEX, ProofDataFile -> CSS7DATA*.DLL, ...), or else by the
+  file the qualifier names (VBA's "vbe.dll_7.1" -> VBE7.DLL, "1033\solver.xlam"). The rest get the
+  feature's first file component.
 * Registry key paths ("22:\Software\...", e.g. Common\InstalledPackages\<product>) are created as
   empty keys; Office checks some of them itself.
 
@@ -125,12 +126,44 @@ ROLE = {
 }
 
 
-def choose_component(category, feature_comps, comps):
+def qualifier_file(qualifier):
+    """The file a qualifier names, normalised: "1033\\solver.xlam" -> "solver.xlam", "vbe.dll_7.1" ->
+    "vbe.dll" (VBA's version suffix), "stintl.dll\\1033" -> "stintl.dll", "x.x86.dll" -> "x.dll"."""
+    for part in qualifier.split("\\"):
+        m = re.match(r"^([A-Za-z][\w .-]*?\.[A-Za-z]\w{0,3})(?:_[\w.]+)?$", part)
+        if m:
+            return m.group(1).lower().replace(".x86", "").replace(" ", "")
+    return None
+
+
+def by_file_name(name, candidates, comps):
+    """The component whose key path file is `name`, or `name` with a number before the extension
+    (vbe.dll -> VBE7.DLL, vbeext.olb -> VBEEXT1.OLB, mspst.dll -> MSPST32.DLL)."""
+    stem, ext = os.path.splitext(name)
+    numbered = re.compile(re.escape(stem) + r"\d+" + re.escape(ext) + "$")
+    files = [(c, comps[c].rsplit("\\", 1)[-1].lower().replace(" ", "")) for c in candidates
+             if resolve(comps.get(c, "")) and not comps[c].endswith("\\")]
+    for match in (lambda f: f == name, numbered.match):
+        for c, f in files:
+            if match(f):
+                return c
+    return None
+
+
+def choose_component(category, qualifier, feature_comps, comps):
     pat = ROLE.get(category.upper())
     if pat:
         for c in feature_comps:
             if re.search(pat, comps.get(c, ""), re.I):
                 return c
+    # Most other qualifiers name the file (VBA's "vbe.dll_7.1", an add-in's "1033\\solver.xlam", a
+    # sound's "arrow.wav"); Office opens whatever the descriptor resolves to, so the first file of
+    # the feature (msvcr100.dll for VBAFiles: "cannot access" every add-in with a VBA project) is
+    # wrong for them.
+    name = qualifier_file(qualifier)
+    c = name and by_file_name(name, feature_comps, comps)
+    if c:
+        return c
     files = [c for c in feature_comps if resolve(comps.get(c, "")) and not comps[c].endswith("\\")]
     return (files or feature_comps or [None])[0]
 
@@ -208,7 +241,7 @@ for manifest in sorted(glob.glob(os.path.join(pkg_dir, "C2RManifest.*.xml"))):
         merged[1].extend(c for c in clist if c not in merged[1])
     for a in elements(text, "PublishComponent"):
         category, qualifier, appdata, feature = a["PublishComponentId"], a.get("Qualifier", ""), a.get("AppData", ""), a.get("Feature", "")
-        comp = a["ComponentId"].upper() if a.get("ComponentId") else choose_component(category, tree.get(feature, ("", []))[1], comps)
+        comp = a["ComponentId"].upper() if a.get("ComponentId") else choose_component(category, qualifier, tree.get(feature, ("", []))[1], comps)
         if not comp or comp.strip("{}") not in comp_path:
             continue
         desc = base85(product) + feature + ">" + base85(comp) + appdata

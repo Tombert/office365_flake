@@ -486,11 +486,26 @@ register_msi_components() {
   umu regedit /S "$reg"
   printf '%s' "$MSI_COMPONENTS_REV" > "$MS365_PREFIX/.ms365-msi-components"
 }
-MSI_COMPONENTS_REV=4   # 4: "<lang>\Normal" category = the spelling lexicon
+MSI_COMPONENTS_REV=5   # 5: qualifiers resolve to the file they name (VBA: VBE7.DLL, not msvcr100.dll)
+
+# VBA UserForms are MSForms designers; VBA creates them through FM20.DLL's designer package class
+# ({AC9F2F90-...}). Click-to-Run publishes that registration only into its App-V virtual registry,
+# which Office's own registry reads see but Wine's COM does not, so every workbook or add-in with
+# a UserForm fails to load (Solver: "cannot access the file"). FM20's DllRegisterServer writes the
+# real keys.
+register_msforms() {
+  local root; root="$(win_prefix_root)"
+  [ "$MS365_EDITION" = 64 ] && [ -f "$root/drive_c/Program Files/Microsoft Office/root/vfs/System/FM20.DLL" ] || return 0
+  log "Registering the MSForms designer (FM20.DLL) for VBA UserForms"
+  umu regsvr32 /s 'C:\Program Files\Microsoft Office\root\vfs\System\FM20.DLL' >/dev/null 2>&1 || true
+  printf '%s' "$MSFORMS_REV" > "$MS365_PREFIX/.ms365-msforms"
+}
+MSFORMS_REV=1
 
 post_install_fixups() {
   mirror_vfs
   register_msi_components
+  register_msforms
   # 64-bit analogue of the classic ruados/eylenburg fix: the app-v subsystem DLLs must sit next
   # to the Office binaries or WINWORD etc. die on startup under Wine.
   local bits="$MS365_EDITION"
@@ -605,6 +620,7 @@ cmd_run() {
     apply_registry
   fi
   if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
+  if [ "$(cat "$MS365_PREFIX/.ms365-msforms" 2>/dev/null)" != "$MSFORMS_REV" ]; then register_msforms; fi
   apply_dpi
   install_ui_fonts
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,

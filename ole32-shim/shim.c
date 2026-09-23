@@ -147,6 +147,31 @@ static const struct patch DELAYPATCHES[] = {
 };
 #define NDELAYPATCHES (sizeof(DELAYPATCHES) / sizeof(DELAYPATCHES[0]))
 
+/* ---- kernel32: GetDllDirectory when no directory is set ----------------------------------
+ * GetDllDirectory returns 0 both for "no DLL directory set" and for failure; callers tell the two
+ * apart with GetLastError, which Windows leaves at ERROR_SUCCESS in the first case. Wine's returns 0
+ * and does not touch the last error, so whatever the thread last failed at (Office's C2R layer
+ * leaves ERROR_ENVVAR_NOT_FOUND lying around) reads as a failure. Excel's Solver checks exactly
+ * this, through VBA's Err.LastDllError, before loading SOLVER32.DLL and gives up with "Solver
+ * encountered an error value in the Objective Cell" on the first Solve of a session. VBA reaches
+ * the function through GetProcAddress, so my_GetProcAddress hands out the wrapper as well. */
+typedef DWORD (WINAPI *pGetDllDirectoryA)(DWORD, LPSTR);
+typedef DWORD (WINAPI *pGetDllDirectoryW)(DWORD, LPWSTR);
+static pGetDllDirectoryA real_GetDllDirectoryA;
+static pGetDllDirectoryW real_GetDllDirectoryW;
+static DWORD WINAPI my_GetDllDirectoryA(DWORD len, LPSTR buf)
+{
+    DWORD r = real_GetDllDirectoryA ? real_GetDllDirectoryA(len, buf) : 0;
+    if (!r) SetLastError(ERROR_SUCCESS);   /* 0: an empty directory (or, only in theory, out of memory) */
+    return r;
+}
+static DWORD WINAPI my_GetDllDirectoryW(DWORD len, LPWSTR buf)
+{
+    DWORD r = real_GetDllDirectoryW ? real_GetDllDirectoryW(len, buf) : 0;
+    if (!r) SetLastError(ERROR_SUCCESS);
+    return r;
+}
+
 typedef FARPROC (WINAPI *pGetProcAddress)(HMODULE, LPCSTR);
 static pGetProcAddress real_GetProcAddress;
 typedef DWORD (WINAPI *pGetModuleBaseNameA_t)(HANDLE, HMODULE, LPSTR, DWORD);
@@ -170,6 +195,9 @@ static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
 {
     FARPROC p = real_GetProcAddress(h, name);
     if (g_trace_mod_name[0] && name && (h == g_trace_mod || !p)) gpa_log(h, name, p);
+    /* by address rather than by module, so a forwarder or an api-set alias resolves the same */
+    if (p && p == (FARPROC)real_GetDllDirectoryA) return (FARPROC)my_GetDllDirectoryA;
+    if (p && p == (FARPROC)real_GetDllDirectoryW) return (FARPROC)my_GetDllDirectoryW;
     if (name && ((ULONG_PTR)name >> 16) != 0) {
         /* functions we wrap (see PATCHES) must be wrapped for dynamic lookups too */
         const struct patch *w = p ? wrapped_lookup(h, name) : NULL;
@@ -223,6 +251,23 @@ static BOOL WINAPI my_CertGetCertificateChain(void *engine, const void *cert, vo
     InterlockedOr(&g_chain_ready, bit);
     ReleaseSRWLockExclusive(&g_chain_lock);
     return ret;
+}
+
+/* ---- virtdisk: GetStorageDependencyInformation ----------------------------------------------------
+ * Before Office opens a macro file (an .xlam add-in such as Solver, .xlsm, .docm) it asks whether the
+ * file's volume is backed by a mounted ISO/VHD, where macros are blocked: it opens the volume, calls
+ * GetStorageDependencyInformation(GET_STORAGE_DEPENDENCY_FLAG_HOST_VOLUMES), retries on
+ * ERROR_INSUFFICIENT_BUFFER, treats any other error as "no backing image", and on success reads entry 0's
+ * host volume and relative path without looking at NumberEntries. Wine's stub returns success with
+ * NumberEntries = 0 and the buffer untouched, so mso copied strings through garbage pointers (Excel crashed
+ * while enabling Solver). Nothing in a Wine prefix sits on a virtual disk: give Windows' answer for an
+ * ordinary volume. */
+#define MY_ERROR_VIRTDISK_NOT_VIRTUAL_DISK 0xC03A0015
+static DWORD WINAPI my_GetStorageDependencyInformation(HANDLE obj, int flags, ULONG size, void *info, ULONG *used)
+{
+    (void)obj; (void)flags; (void)size; (void)info;
+    if (used) *used = 0;
+    return MY_ERROR_VIRTDISK_NOT_VIRTUAL_DISK;
 }
 
 /* ---- WinHTTP options Wine has not implemented -------------------------------------------
@@ -1260,6 +1305,71 @@ static HRESULT WINAPI my_D2D1CreateFactory(int type, REFIID iid, const void *opt
     return hr;
 }
 
+/* ---- oleaut32: vtable size of 32-bit type libraries in a 64-bit process --------------------
+ * Excel's, Word's and Office's type libraries are SYS_WIN32 (they are shared with 32-bit Office)
+ * and store per-interface vtable sizes in 4-byte slots: _Worksheet, 158 slots, is stored as 632.
+ * Wine's typelib reader scales every method's oVft to native pointers (Range is at 800) but hands
+ * TYPEATTR.cbSizeVft out unscaled, so an interface looks shorter than its own last method. VBA
+ * sizes the dispatch tables of document modules (ThisWorkbook, Sheet1) from cbSizeVft, and any
+ * call through them past slot 79 jumps into garbage: "Automation error" or a crash. This wraps
+ * ITypeInfo::GetTypeAttr on Wine's shared type-info vtable, patched when the first type library
+ * is loaded, and scales cbSizeVft of interfaces from 32-bit libraries. (Wine reports libraries
+ * created in-process with ICreateTypeLib2 in the library's own pointer size as Windows does;
+ * MSForms creates only dispinterfaces that way, which this leaves alone.) */
+typedef HRESULT (WINAPI *pLoadTypeLibEx)(LPCOLESTR, REGKIND, ITypeLib **);
+typedef HRESULT (WINAPI *pLoadTypeLib)(LPCOLESTR, ITypeLib **);
+typedef HRESULT (WINAPI *pLoadRegTypeLib)(REFGUID, WORD, WORD, LCID, ITypeLib **);
+typedef HRESULT (WINAPI *pGetTypeAttr)(ITypeInfo *, TYPEATTR **);
+static pLoadTypeLibEx real_LoadTypeLibEx;
+static pLoadTypeLib real_LoadTypeLib;
+static pLoadRegTypeLib real_LoadRegTypeLib;
+static pGetTypeAttr real_GetTypeAttr;
+static HRESULT WINAPI my_GetTypeAttr(ITypeInfo *ti, TYPEATTR **out)
+{
+    HRESULT hr = real_GetTypeAttr(ti, out);
+    ITypeLib *tl; UINT idx; TLIBATTR *la;
+    if (FAILED(hr) || !out || !*out || (*out)->typekind != TKIND_INTERFACE || !(*out)->cbSizeVft) return hr;
+    if (FAILED(ITypeInfo_GetContainingTypeLib(ti, &tl, &idx))) return hr;
+    if (SUCCEEDED(ITypeLib_GetLibAttr(tl, &la))) {
+        if (la->syskind != SYS_WIN64) (*out)->cbSizeVft *= sizeof(void *) / 4;
+        ITypeLib_ReleaseTLibAttr(tl, la);
+    }
+    ITypeLib_Release(tl);
+    return hr;
+}
+static void patch_typeinfo_vtable(ITypeLib *tl)
+{
+    static LONG done; ITypeInfo *ti; void **vt; DWORD old;
+    if (done || !tl || !ITypeLib_GetTypeInfoCount(tl) || FAILED(ITypeLib_GetTypeInfo(tl, 0, &ti))) return;
+    vt = *(void ***)ti;   /* slot 3: IUnknown's three, then GetTypeAttr */
+    if (vt[3] != (void *)my_GetTypeAttr && VirtualProtect(&vt[3], sizeof(void *), PAGE_READWRITE, &old)) {
+        real_GetTypeAttr = (pGetTypeAttr)vt[3];
+        vt[3] = (void *)my_GetTypeAttr;
+        VirtualProtect(&vt[3], sizeof(void *), old, &old);
+        done = 1;
+        OutputDebugStringA("ms365 ole32 shim: ITypeInfo::GetTypeAttr wrapped (cbSizeVft of 32-bit type libraries)");
+    }
+    ITypeInfo_Release(ti);
+}
+static HRESULT WINAPI my_LoadTypeLibEx(LPCOLESTR file, REGKIND kind, ITypeLib **out)
+{
+    HRESULT hr = real_LoadTypeLibEx ? real_LoadTypeLibEx(file, kind, out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out) patch_typeinfo_vtable(*out);
+    return hr;
+}
+static HRESULT WINAPI my_LoadTypeLib(LPCOLESTR file, ITypeLib **out)
+{
+    HRESULT hr = real_LoadTypeLib ? real_LoadTypeLib(file, out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out) patch_typeinfo_vtable(*out);
+    return hr;
+}
+static HRESULT WINAPI my_LoadRegTypeLib(REFGUID guid, WORD maj, WORD min, LCID lcid, ITypeLib **out)
+{
+    HRESULT hr = real_LoadRegTypeLib ? real_LoadRegTypeLib(guid, maj, min, lcid, out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out) patch_typeinfo_vtable(*out);
+    return hr;
+}
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
@@ -1278,8 +1388,14 @@ static const struct patch PATCHES[] = {
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
     { "kernel32.dll", "SetThreadpoolTimerEx",        (void *)my_SetThreadpoolTimerEx },
+    { "kernel32.dll", "GetDllDirectoryA",            (void *)my_GetDllDirectoryA },
+    { "kernel32.dll", "GetDllDirectoryW",            (void *)my_GetDllDirectoryW },
     { "d2d1.dll",     "D2D1CreateFactory",           (void *)my_D2D1CreateFactory },
     { "crypt32.dll",  "CertGetCertificateChain",     (void *)my_CertGetCertificateChain },
+    { "virtdisk.dll", "GetStorageDependencyInformation", (void *)my_GetStorageDependencyInformation },
+    { "oleaut32.dll", "LoadTypeLibEx",               (void *)my_LoadTypeLibEx },
+    { "oleaut32.dll", "LoadTypeLib",                 (void *)my_LoadTypeLib },
+    { "oleaut32.dll", "LoadRegTypeLib",              (void *)my_LoadRegTypeLib },
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
@@ -1296,6 +1412,8 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "user32.dll", NULL },
     { "d2d1.dll", NULL },
     { "crypt32.dll", NULL },
+    { "virtdisk.dll", NULL },
+    { "oleaut32.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -1309,6 +1427,12 @@ static const char *ordinal_name(const char *dll, WORD ordinal)
     }
     /* react-native-win32 (the licensing dialog) links d2d1 #1, D2D1CreateFactory in both d2d1s */
     if (lstrcmpiA(dll, "d2d1.dll") == 0 && ordinal == 1) return "D2D1CreateFactory";
+    /* Office links all of oleaut32 by ordinal; Wine's oleaut32.spec keeps Windows' numbering */
+    if (lstrcmpiA(dll, "oleaut32.dll") == 0) {
+        if (ordinal == 161) return "LoadTypeLib";
+        if (ordinal == 162) return "LoadRegTypeLib";
+        if (ordinal == 183) return "LoadTypeLibEx";
+    }
     return NULL;
 }
 static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name)
@@ -1363,6 +1487,10 @@ static void note_module(HMODULE h, const char *modname)
             real_D2D1CreateFactory = (pD2D1CreateFactory)real_GetProcAddress(h, "D2D1CreateFactory");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "crypt32.dll") == 0) {
             real_CertGetCertificateChain = (pCertGetCertificateChain)real_GetProcAddress(h, "CertGetCertificateChain");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "oleaut32.dll") == 0) {
+            real_LoadTypeLibEx = (pLoadTypeLibEx)real_GetProcAddress(h, "LoadTypeLibEx");
+            real_LoadTypeLib = (pLoadTypeLib)real_GetProcAddress(h, "LoadTypeLib");
+            real_LoadRegTypeLib = (pLoadRegTypeLib)real_GetProcAddress(h, "LoadRegTypeLib");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");
@@ -1573,6 +1701,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         real_GetProcAddress = (pGetProcAddress)GetProcAddress(k32, "GetProcAddress");
         real_GetModuleBaseNameA = (pGetModuleBaseNameA_t)GetProcAddress(k32, "K32GetModuleBaseNameA");
+        real_GetDllDirectoryA = (pGetDllDirectoryA)GetProcAddress(k32, "GetDllDirectoryA");
+        real_GetDllDirectoryW = (pGetDllDirectoryW)GetProcAddress(k32, "GetDllDirectoryW");
         GetEnvironmentVariableA("MS365_TRACE_MODULE", g_trace_mod_name, sizeof(g_trace_mod_name));
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         pLdrRegisterDllNotification reg = ntdll ? (pLdrRegisterDllNotification)GetProcAddress(ntdll, "LdrRegisterDllNotification") : NULL;
