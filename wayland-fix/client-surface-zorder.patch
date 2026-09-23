@@ -1,0 +1,66 @@
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2606,6 +2606,55 @@
+     return TRUE;
+ }
+ 
++/* Client surfaces below the parent surface, collected top-to-bottom in Win32 paint order: a
++ * window's children (first child topmost) above the window itself. 'current' is the client being
++ * stacked right now; its toplevel_wl_surface may not be set yet. Called with win_data_mutex held. */
++static void wayland_surface_collect_clients(struct wayland_surface *surface, HWND parent,
++                                            struct wayland_client_surface *current,
++                                            struct wayland_client_surface **clients,
++                                            UINT *count, UINT max, UINT depth)
++{
++    HWND child;
++
++    if (depth > 32) return;
++    for (child = NtUserGetWindowRelative(parent, GW_CHILD); child && *count < max;
++         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
++    {
++        struct wayland_win_data *data;
++        struct wayland_client_surface *client;
++
++        if (!(NtUserGetWindowLongW(child, GWL_STYLE) & WS_VISIBLE)) continue;
++        wayland_surface_collect_clients(surface, child, current, clients, count, max, depth + 1);
++        if (!(data = wayland_win_data_get_nolock(child))) continue;
++        LIST_FOR_EACH_ENTRY(client, &data->client_surfaces, struct wayland_client_surface, hwnd_entry)
++        {
++            if (*count >= max) break;
++            if (!client->wl_subsurface || client->stack_above_parent) continue;
++            if (client != current && client->toplevel_wl_surface != surface->wl_surface) continue;
++            clients[(*count)++] = client;
++        }
++    }
++}
++
++/* Subsurfaces are stacked below the parent surface one by one as they are created or moved, so the
++ * last one configured ends up on top whatever the Win32 z-order says (OneNote's full-size navigation
++ * background covered its notebook and page lists). Restack all of them in Win32 order. */
++static void wayland_surface_restack_clients(struct wayland_surface *surface,
++                                            struct wayland_client_surface *current)
++{
++    struct wayland_client_surface *clients[128];
++    struct wl_surface *above = wayland_surface_client_stack_anchor(surface);
++    UINT count = 0, i;
++
++    wayland_surface_collect_clients(surface, surface->hwnd, current, clients, &count, ARRAY_SIZE(clients), 0);
++    for (i = 0; i < count; i++)
++    {
++        wl_subsurface_place_below(clients[i]->wl_subsurface, above);
++        above = clients[i]->wl_surface;
++    }
++    TRACE("hwnd=%p restacked %u client surfaces\n", surface->hwnd, count);
++}
++
+ static void wayland_client_surface_stack(struct wayland_surface *surface,
+                                          struct wayland_client_surface *client,
+                                          BOOL stack_above_parent)
+@@ -2622,6 +2671,7 @@
+         wl_subsurface_place_below(client->wl_subsurface,
+                                   wayland_surface_client_stack_anchor(surface));
+     client->stack_above_parent = stack_above_parent;
++    if (!effective_stack_above_parent) wayland_surface_restack_clients(surface, client);
+ }
+ 
+ static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,

@@ -17,10 +17,22 @@
       # what MS365_WAYLAND=1 needs on HiDPI outputs. Override the version until nixpkgs catches up.
       protonGEPkg = pkgs.proton-ge-bin.overrideAttrs (final: prev:
         let
-          src = pkgs.fetchzip {
+          release = pkgs.fetchzip {
             url = "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/${final.version}/${final.version}-x86_64.tar.gz";
             hash = "sha256-ftW0vE45v2JsbaYqo/So0ZFfvdtakHX0XEXEE4TdxLk=";
           };
+          # GE's Wayland driver stacks the subsurfaces of self-presenting child windows in the order
+          # they were created or last moved, not in Win32 z-order (see wayland-fix/). Swap in the
+          # patched winewayland.so. Wine finds its unix libraries next to the resolved ntdll.so, so
+          # those (and the loaders in files/bin) are real copies; everything else stays a symlink.
+          src = pkgs.runCommand "${final.version}-x86_64-ms365" { } ''
+            cp -rs ${release}/. $out
+            chmod -R u+w $out
+            for f in $out/files/lib/wine/x86_64-unix/* $out/files/bin/*; do
+              [ -L "$f" ] && cp --remove-destination "$(readlink -f "$f")" "$f"
+            done
+            install -m755 ${./wayland-fix/winewayland.so} $out/files/lib/wine/x86_64-unix/winewayland.so
+          '';
         in {
           version = "GE-Proton11-7";
           inherit src;

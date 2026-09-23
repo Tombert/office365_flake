@@ -57,21 +57,14 @@ key installs). The product runs in the same vNext mode as Microsoft 365; at the 
 "Sign in to get started", and signing in with the account the key was redeemed to activates it.
 Verified with a retail Home 2024 key.
 
-**OneNote is glitchy.** Word, Excel and PowerPoint work; OneNote starts and signs in, but:
+**OneNote works** as of 2026-09-23: it starts, signs in, shows the notebook and page lists and the
+page, and edits save. Getting there took four fixes (all in the table below): a start-up crash in
+Office's App-V layer, page text drawn as black boxes, the navigation panes hidden behind a black
+layer (a Wayland driver fix, `wayland-fix/`), and OneNote's own "How do you want to start OneNote?"
+prompt after every unclean exit. OneNote for the web (installable as a PWA) remains an alternative
+on the same OneDrive notebooks.
 
-* the page canvas paints black rectangles wherever it redraws (typed text, the page title), which
-  looks like the hardware-accelerated Direct2D/DirectComposition path; *File → Options → Advanced →
-  Disable hardware graphics acceleration* is worth a try, untested so far;
-* the notebook navigation pane stays blank: it is React Native UI, which needs `Windows.Web.Http`.
-  The shim now registers stand-in classes whose requests fail as "cannot connect" (see the table
-  below); whether that brings the pane back has not been tested yet;
-* notebooks open read-only ("You can't edit this notebook because it's not syncing"); not
-  investigated.
-
-Until then, OneNote for the web (installable as a PWA from Chrome/Edge/Brave) works on the same
-OneDrive notebooks and covers everyday note-taking.
-
-Pull requests are welcome, for OneNote or anything else in the known-problems list. Most fixes here
+Pull requests are welcome, for anything in the known-problems list. Most fixes here
 follow the same loop: `MS365_DEBUG=1` (plus `MS365_WINEDEBUG` channels), find the Wine stub or
 missing class Office trips on in `~/.local/share/<ms365|office2024>/logs/steam-0.log`, and fill the
 gap in one of the shims.
@@ -96,7 +89,7 @@ All optional, all environment variables:
 | `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
 | `MS365_TRACE_MODULE` | unset | debugging: the shim logs every export lookup into this DLL and every failed lookup (`MS365_DEBUG=1` to see them) |
 | `MS365_WAYLAND` | `1` | Wine's Wayland driver in a Wayland session; `0` for X11/Xwayland (popup menus close instantly there under sway and other wlroots compositors) |
-| `MS365_NO_PIXEL_UNITS` | unset | `1` turns off the shim's Direct2D pixel-unit-mode fix (Excel's formula-bar icons; see "Known problems") |
+| `MS365_NO_PIXEL_UNITS` | unset | `1` turns off the shim's Direct2D pixel-unit-mode fix (Excel's formula-bar icons, see the fixes table) |
 | `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver, 96 on X11 |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
@@ -149,7 +142,11 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Word exits with code 64 a second after start, before the "Sign in to get started" dialog can open | the dialog (react-native-win32) draws its icons with `ID2D1DeviceContext5::CreateSvgDocument`, a stub returning `E_NOTIMPL` in Wine's d2d1; Office writes through the missing document. The shim wraps `D2D1CreateFactory` (Office links it as `d2d1 #1`) and on the first call patches the device-context vtable so `CreateSvgDocument` falls back to an empty document that accepts everything and draws nothing. The dialog works, its two icons are blank |
 | OneNote refuses to start: "You'll need to install the Desktop Experience before you start OneNote" | OneNote checks that the Tablet PC ink object `CLSID_InkDisp` (InkObj.dll) is registered; Wine's `inkobj` is an empty stub, so OneNote concludes it is on Windows Server without the Desktop Experience feature. `ms365uia.dll` (uia-shim/) now also serves an empty `InkDisp` (every ink method `E_NOTIMPL`), registered by the launcher |
 | OneNote runs `SELECT Name FROM Win32_ServerFeature`; Wine's WMI answers with an empty result where client Windows says "invalid class" | the shim wraps `CoCreateInstance(Ex)` for `CLSID_WbemLocator` only and makes that query fail with `WBEM_E_INVALID_CLASS`. OneNote delay-loads `CoCreateInstanceEx` through ntdll's resolver, which the `GetProcAddress` hook never sees, so the shim also fills those delay-load slots up front. Not needed once `InkDisp` is registered, kept as the client-Windows answer |
-| OneNote's navigation pane is blank; its React Native JavaScript thread loops in Office's error reporting (hundreds of thousands of handled access violations a minute) | react-native-win32 builds a `Windows.Web.Http` `HttpBaseProtocolFilter` and `HttpClient` at start; Wine has no `Windows.Web.Http`. The shim serves stand-ins (filter, cache control, client, `HttpMethod`; requests fail with `0x80072EFD` "cannot connect") and exports `DllGetActivationFactory`; the launcher registers them under `WindowsRuntime\ActivatableClassId` with `ms365shim.dll` as `DllPath`. **Experimental, untested** |
+| OneNote's React Native JavaScript thread loops in Office's error reporting (hundreds of thousands of handled access violations a minute) | react-native-win32 builds a `Windows.Web.Http` `HttpBaseProtocolFilter` and `HttpClient` at start; Wine has no `Windows.Web.Http`. The shim serves stand-ins (filter, cache control, client, `HttpMethod`; requests fail with `0x80072EFD` "cannot connect") and exports `DllGetActivationFactory`; the launcher registers them under `WindowsRuntime\ActivatableClassId` with `ms365shim.dll` as `DllPath`. **Experimental.** (The blank navigation pane once blamed on this was the Wayland stacking problem below) |
+| OneNote crashes about every second start (page fault writing 0x8 in `AppVIsvSubsystems64`, under winhttp → crypt32 → `CloseHandle`) | Wine's crypt32 builds its default certificate chain engines on first use; when two threads verify a certificate at once, both build one and the loser frees its copy immediately. Closing that copy's registry store (the key, then its change-notification event) crashes in Office's App-V layer. The shim wraps `CertGetCertificateChain` and serialises the first chain on each default engine, so there is no loser |
+| OneNote opens with "How do you want to start OneNote?" (start normally / delete the cache / delete settings) after a crash or a kill | OneNote keeps its own `ConsecutiveBootCrashes` / `ConsecutiveEarlyCrashes` counters under `OneNote\General`; the launcher resets them along with Office's safe-mode prompt (kept with `MS365_KEEP_SAFEMODE_PROMPT=1`) |
+| OneNote draws every line of page text (date, time, body) as a black box; only the title shows | OneNote renders each text line into a cache cell: clip, clear, clip again, clear to white, draw the glyphs, at DPI 180 with a translated world transform. Wine's d2d1 (including 11.16) turns a `PushAxisAlignedClip` rectangle into pixels as (rect × dpi/96) × transform, so the translation is not scaled while everything drawn is; at any DPI other than 96 a translated clip lands elsewhere and the line is clipped away. The shim wraps `PushAxisAlignedClip` and hands Wine a transform whose translation is already scaled while it computes the clip |
+| OneNote's notebook and page lists stay black and its page is black until the window is resized; Excel's cell grid is sometimes blank until a resize | GE's Wayland driver gives each child window with its own swapchain a subsurface below the window surface and stacks it there when it is created or moved, so the one configured last ends up on top whatever the Win32 z-order says: OneNote's full-size navigation background (the bottom sibling, created after the lists) covered them, Excel's `XLDESK` covered the grid. `wayland-fix/client-surface-zorder.patch` restacks all client subsurfaces of a window in Win32 order whenever one is stacked; `wayland-fix/winewayland.so` is GE-Proton11-7's driver built with it (Steam Runtime 4 SDK container, stripped), and the flake swaps it into the runner. Worth sending upstream to GE |
 | Excel's formula-bar buttons (name-box ▾, ⋮ grip, cancel / enter / fx, the expand chevron) and the splitter next to the sheet tabs are black boxes, or icons shifted down and cut in half | Office draws those icons as glyphs from its own symbol fonts (`OFFSYM*.TTF`) with Direct2D in pixel unit mode (`D2D1_UNIT_MODE_PIXELS`) on contexts whose DPI it sets to the system DPI. Wine's d2d1 (including 11.16) stores the unit mode but still scales everything by dpi / 96, so at 180 dpi each icon is drawn 1.875 times too large and too far down, mostly outside its box; the empty rest is transparent and shows as black. The shim wraps the device-context vtable: while a context is in pixel mode Wine's DPI is held at 96 and `GetDpi` reports the DPI Office set. `MS365_NO_PIXEL_UNITS=1` turns it off |
 | Segoe UI text (OneNote's canvas and messages, some dialogs) renders in Times New Roman | GE-Proton's prefix template maps Segoe UI to Times New Roman. The flake fetches Selawik (Microsoft's MIT-licensed, metric-compatible stand-in for Segoe UI), the launcher installs it into `windows\Fonts` and maps the Segoe UI family (regular, Semibold, Semilight, Light) to it |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
@@ -200,13 +197,6 @@ on Wine's `JsonValue`).
 
 ## Known problems
 
-* **Excel's worksheet may stay blank until the window is resized.** Right after start the cell
-  grid (column and row headers, cells, sheet tabs) can be an empty grey area while the ribbon and
-  formula bar are fine. Resizing the window once (in sway, e.g. toggling fullscreen twice) makes
-  Excel redraw it, and it stays correct afterwards. This showed up together with the pixel-unit-mode
-  fix for the formula-bar icons (see the table above), so it is most likely a side effect of it;
-  before that fix the grid drew at start. `MS365_NO_PIXEL_UNITS=1` switches the fix off (and brings
-  the black formula-bar boxes back).
 * **Proofing categories are mapped by file role.** The Click-to-Run manifests list which qualified
   component categories a language package publishes but not which file each one stands for;
   `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to
