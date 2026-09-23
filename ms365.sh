@@ -163,8 +163,8 @@ apply_dpi() {
 }
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
-REGISTRY_REV=6
-SHIMS_REV=sppc,ole32,uia,d2d1,appinit   # bump when install_shims gains a DLL or an override
+REGISTRY_REV=7
+SHIMS_REV=sppc,ole32,uia,d2d1,appinit,ink,webhttp   # bump when install_shims gains a DLL or an override
 apply_registry() {
   mkdir -p "$ODT_DIR"
   local reg="$ODT_DIR/ms365.reg"
@@ -184,6 +184,12 @@ Windows Registry Editor Version 5.00
 ; MSIX add-ons in its LastRun task. With the library unavailable Office logs an error and moves on.
 ; Wine's hvsimanagementapi (Windows Sandbox host) is a stub answering E_NOTIMPL; the Click-to-Run
 ; client turns that into a fatal exception when it applies product changes. Absent, it is skipped.
+[HKEY_CURRENT_USER\Software\Wine\Fonts\Replacements]
+"Segoe UI"="Selawik"
+"Segoe UI Semibold"="Selawik Semibold"
+"Segoe UI Semilight"="Selawik Semilight"
+"Segoe UI Light"="Selawik Light"
+
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "appxdeploymentclient"=""
 "hvsimanagementapi"=""
@@ -306,6 +312,21 @@ put_dll() { # put_dll <src> <system32 name>
   fi
 }
 
+# Office's UI font is Segoe UI, which Wine does not have, and Proton's prefix template replaces it
+# with Times New Roman (OneNote's canvas, dialogs). Install Selawik, Microsoft's metric-compatible
+# open-source stand-in (the flake fetches it), and point the Segoe UI family at it (apply_registry).
+install_ui_fonts() {
+  [ -n "${MS365_UI_FONTS:-}" ] || return 0
+  local root; root="$(win_prefix_root)"
+  local dir="$root/drive_c/windows/Fonts" f
+  mkdir -p "$dir"
+  for f in "$MS365_UI_FONTS"/*.ttf; do
+    [ -f "$dir/$(basename "$f")" ] && cmp -s "$f" "$dir/$(basename "$f")" && continue
+    log "Installing UI font $(basename "$f")"
+    cp -f "$f" "$dir/" && chmod 644 "$dir/$(basename "$f")"
+  done
+}
+
 install_shims() {
   [ "$MS365_EDITION" = 64 ] || { warn "DLL shims are x86_64 only; 32-bit Office will hit the SLInstallLicense stub"; return 0; }
   put_dll "$MS365_SPPC_SHIM" sppc.dll
@@ -348,6 +369,38 @@ Windows Registry Editor Version 5.00
 @="ms365 UIAutomationRegistrar"
 
 [HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}\InprocServer32]
+@="C:\\windows\\system32\\ms365uia.dll"
+"ThreadingModel"="Both"
+
+; Windows.Web.Http (Wine has none): OneNote's React Native UI builds an HttpClient at start and its
+; JavaScript thread dies without one. The ole32 shim (ms365shim.dll) serves stand-ins whose requests
+; fail as "cannot connect".
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Web.Http.Filters.HttpBaseProtocolFilter]
+"DllPath"="C:\\windows\\system32\\ms365shim.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Web.Http.HttpClient]
+"DllPath"="C:\\windows\\system32\\ms365shim.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Web.Http.HttpMethod]
+"DllPath"="C:\\windows\\system32\\ms365shim.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Web.Http.HttpRequestMessage]
+"DllPath"="C:\\windows\\system32\\ms365shim.dll"
+
+; CLSID_InkDisp (Tablet PC ink, InkObj.dll on Windows; a stub DLL in Wine). OneNote creates one at
+; start and without it refuses to open ("You'll need to install the Desktop Experience"). ms365uia.dll
+; serves an empty ink object.
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{937C1A34-151D-4610-9CA6-A8CC9BDB5D83}]
+@="ms365 InkDisp"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{937C1A34-151D-4610-9CA6-A8CC9BDB5D83}\InprocServer32]
+@="C:\\windows\\system32\\ms365uia.dll"
+"ThreadingModel"="Both"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{937C1A34-151D-4610-9CA6-A8CC9BDB5D83}]
+@="ms365 InkDisp"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{937C1A34-151D-4610-9CA6-A8CC9BDB5D83}\InprocServer32]
 @="C:\\windows\\system32\\ms365uia.dll"
 "ThreadingModel"="Both"
 
@@ -442,6 +495,7 @@ cmd_install() {
   apply_tricks
   apply_registry
   install_shims
+  install_ui_fonts
   write_config
   fetch_odt
   local phase="${1:-all}"
@@ -508,6 +562,7 @@ cmd_run() {
   fi
   if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
   apply_dpi
+  install_ui_fonts
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
   if [ "$MS365_EDITION" = 64 ]; then

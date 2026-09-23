@@ -15,6 +15,7 @@
 , ole32ShimSoda
 , uiaShim
 , d2d1Fix
+, selawik
   # Variant knobs: the same launcher, packaged under another command name with other defaults
   # (e.g. a retail Office 2024 SKU in its own prefix next to Microsoft 365).
 , cliName ? "ms365"
@@ -53,7 +54,8 @@ let
       MS365_UIA_SHIM=${uiaShim}/lib/wine/x86_64-windows/ms365uia.dll
       MS365_D2D1_DLL=${d2d1Fix}/lib/wine/x86_64-windows/d2d1.dll
       MS365_MSI_COMPONENTS=${./msi-components.py}
-      export MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_MSI_COMPONENTS
+      MS365_UI_FONTS=${selawik}
+      export MS365_UI_FONTS MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_MSI_COMPONENTS
       ${builtins.readFile ./ms365.sh}
     '';
   };

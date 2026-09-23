@@ -57,6 +57,25 @@ key installs). The product runs in the same vNext mode as Microsoft 365; at the 
 "Sign in to get started", and signing in with the account the key was redeemed to activates it.
 Verified with a retail Home 2024 key.
 
+**OneNote is glitchy.** Word, Excel and PowerPoint work; OneNote starts and signs in, but:
+
+* the page canvas paints black rectangles wherever it redraws (typed text, the page title), which
+  looks like the hardware-accelerated Direct2D/DirectComposition path; *File → Options → Advanced →
+  Disable hardware graphics acceleration* is worth a try, untested so far;
+* the notebook navigation pane stays blank: it is React Native UI, which needs `Windows.Web.Http`.
+  The shim now registers stand-in classes whose requests fail as "cannot connect" (see the table
+  below); whether that brings the pane back has not been tested yet;
+* notebooks open read-only ("You can't edit this notebook because it's not syncing"); not
+  investigated.
+
+Until then, OneNote for the web (installable as a PWA from Chrome/Edge/Brave) works on the same
+OneDrive notebooks and covers everyday note-taking.
+
+Pull requests are welcome, for OneNote or anything else in the known-problems list. Most fixes here
+follow the same loop: `MS365_DEBUG=1` (plus `MS365_WINEDEBUG` channels), find the Wine stub or
+missing class Office trips on in `~/.local/share/<ms365|office2024>/logs/steam-0.log`, and fill the
+gap in one of the shims.
+
 ## Knobs
 
 All optional, all environment variables:
@@ -127,6 +146,10 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Thin lines across the middle of the screen on the Wayland driver (a vertical and a horizontal one through a maximized Word) | those are the same shadow strips, floated: a Wayland client cannot position its toplevels, so sway centres each one. On the Wayland driver the shim also subclasses the strips and drops `SWP_SHOWWINDOW` in `WM_WINDOWPOSCHANGING`, so they never show; Office just has no window shadows |
 | Office Home 2024 install: `setup.exe` aborts half a second in, no log (exit 3) | for consumer SKUs the ODT bootstrapper asks the WinRT `PackageManager` whether Office is installed from the Store and aborts when the class cannot be activated. Wine's `appxdeploymentclient` answers that query, so it is enabled for `setup.exe` only (`AppDefaults\setup.exe\DllOverrides`); `OfficeClickToRun.exe` keeps it disabled (see the LastRun row above) |
 | Word exits with code 64 a second after start, before the "Sign in to get started" dialog can open | the dialog (react-native-win32) draws its icons with `ID2D1DeviceContext5::CreateSvgDocument`, a stub returning `E_NOTIMPL` in Wine's d2d1; Office writes through the missing document. The shim wraps `D2D1CreateFactory` (Office links it as `d2d1 #1`) and on the first call patches the device-context vtable so `CreateSvgDocument` falls back to an empty document that accepts everything and draws nothing. The dialog works, its two icons are blank |
+| OneNote refuses to start: "You'll need to install the Desktop Experience before you start OneNote" | OneNote checks that the Tablet PC ink object `CLSID_InkDisp` (InkObj.dll) is registered; Wine's `inkobj` is an empty stub, so OneNote concludes it is on Windows Server without the Desktop Experience feature. `ms365uia.dll` (uia-shim/) now also serves an empty `InkDisp` (every ink method `E_NOTIMPL`), registered by the launcher |
+| OneNote runs `SELECT Name FROM Win32_ServerFeature`; Wine's WMI answers with an empty result where client Windows says "invalid class" | the shim wraps `CoCreateInstance(Ex)` for `CLSID_WbemLocator` only and makes that query fail with `WBEM_E_INVALID_CLASS`. OneNote delay-loads `CoCreateInstanceEx` through ntdll's resolver, which the `GetProcAddress` hook never sees, so the shim also fills those delay-load slots up front. Not needed once `InkDisp` is registered, kept as the client-Windows answer |
+| OneNote's navigation pane is blank; its React Native JavaScript thread loops in Office's error reporting (hundreds of thousands of handled access violations a minute) | react-native-win32 builds a `Windows.Web.Http` `HttpBaseProtocolFilter` and `HttpClient` at start; Wine has no `Windows.Web.Http`. The shim serves stand-ins (filter, cache control, client, `HttpMethod`; requests fail with `0x80072EFD` "cannot connect") and exports `DllGetActivationFactory`; the launcher registers them under `WindowsRuntime\ActivatableClassId` with `ms365shim.dll` as `DllPath`. **Experimental, untested** |
+| Segoe UI text (OneNote's canvas and messages, some dialogs) renders in Times New Roman | GE-Proton's prefix template maps Segoe UI to Times New Roman. The flake fetches Selawik (Microsoft's MIT-licensed, metric-compatible stand-in for Segoe UI), the launcher installs it into `windows\Fonts` and maps the Segoe UI family (regular, Semibold, Semilight, Light) to it |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`

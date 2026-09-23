@@ -66,7 +66,15 @@
       # newer Direct2D for both runners' Wine 11.0 base (ribbon controls rendered as grey blocks)
       d2d1Fix = pkgs.callPackage ./d2d1-fix { wine = pkgs.wine64Packages.unstable; };
 
-      launcherDeps = { inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix; };
+      # Selawik: Microsoft's open-source (MIT) metric-compatible stand-in for Segoe UI, the Office UI
+      # font. Proton's prefix template maps Segoe UI to Times New Roman, which OneNote's canvas shows.
+      selawik = pkgs.fetchzip {
+        url = "https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_Release.zip";
+        hash = "sha256-BbjXJ8HFXrRklMOnGXyZIZeQ5Oksda4AqQXHmNqN6AQ=";
+        stripRoot = false;
+      };
+
+      launcherDeps = { inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix selawik; };
 
       ms365 = pkgs.callPackage ./ms365.nix launcherDeps;
 
