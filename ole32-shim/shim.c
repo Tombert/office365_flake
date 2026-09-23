@@ -199,6 +199,32 @@ static const struct patch STUBPATCHES[] = {
 };
 #define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
 
+/* ---- crypt32: the first chain on a default engine ----------------------------------------------
+ * Wine's crypt32 builds the default chain engines (HCCE_CURRENT_USER / HCCE_LOCAL_MACHINE) on first
+ * use. When two threads verify a certificate at the same moment (OneNote's first HTTPS requests at
+ * start), both build one and the loser frees its copy at once; closing that copy's registry store
+ * (RegCloseKey, then CloseHandle on the key's change-notification event) crashes inside Office's
+ * App-V layer (AppVIsvSubsystems64 null write) in about every second OneNote start. Serialise
+ * CertGetCertificateChain on a default engine until that engine exists, so there is no loser. */
+typedef BOOL (WINAPI *pCertGetCertificateChain)(void *, const void *, void *, void *, void *, DWORD, void *, void **);
+static pCertGetCertificateChain real_CertGetCertificateChain;
+static SRWLOCK g_chain_lock = SRWLOCK_INIT;
+static LONG g_chain_ready;      /* bit 0: current-user engine built, bit 1: local-machine engine */
+static BOOL WINAPI my_CertGetCertificateChain(void *engine, const void *cert, void *time, void *store,
+                                              void *para, DWORD flags, void *reserved, void **chain)
+{
+    pCertGetCertificateChain fn = real_CertGetCertificateChain;
+    LONG bit = !engine ? 1 : engine == (void *)1 ? 2 : 0;     /* HCCE_CURRENT_USER, HCCE_LOCAL_MACHINE */
+    BOOL ret;
+    if (!fn) { SetLastError(ERROR_PROC_NOT_FOUND); return FALSE; }
+    if (!bit || (g_chain_ready & bit)) return fn(engine, cert, time, store, para, flags, reserved, chain);
+    AcquireSRWLockExclusive(&g_chain_lock);
+    ret = fn(engine, cert, time, store, para, flags, reserved, chain);
+    InterlockedOr(&g_chain_ready, bit);
+    ReleaseSRWLockExclusive(&g_chain_lock);
+    return ret;
+}
+
 /* ---- WinHTTP options Wine has not implemented -------------------------------------------
  * Wine's winhttp fails WinHttpSetOption/WinHttpQueryOption with ERROR_WINHTTP_INVALID_OPTION
  * (12009) for options it doesn't know, and Office's OneAuth treats that as a failed request
@@ -1135,6 +1161,70 @@ static void patch_unit_mode(void *ctx)
     svg_log("ms365 ole32 shim: ID2D1DeviceContext pixel unit mode emulated");
 }
 
+/* ---- Direct2D: axis-aligned clips at non-96 DPI --------------------------------------------------------
+ * Wine's d2d1 (through at least 11.16) turns a PushAxisAlignedClip rectangle into device pixels as
+ * (rect * dpi/96) * world transform, while everything it draws goes through (point * world transform)
+ * * dpi/96: the transform's translation is not scaled for clips. At any DPI other than 96 a translated
+ * clip lands off by translation * (dpi/96 - 1). OneNote renders every line of page text into a cache
+ * cell that way (clip, clear, clip, white clear, glyphs, at DPI 180 with a translation), so the lines
+ * were clipped away and came out as black boxes. While Wine computes the clip, hand it a transform whose
+ * translation is already scaled. Command-list targets record the calls instead and are left alone. */
+static const GUID MY_IID_ID2D1CommandList = { 0xb4f34a19, 0x2383, 0x4d76, { 0x94, 0xf6, 0xec, 0x34, 0x36, 0x57, 0xc3, 0xdc } };
+#define D2D_RT_SETTRANSFORM        30
+#define D2D_RT_GETTRANSFORM        31
+#define D2D_RT_PUSHAXISALIGNEDCLIP 45
+#define D2D_CTX_GETTARGET          75
+typedef struct { float _11, _12, _21, _22, _31, _32; } my_mat3x2;
+typedef void (WINAPI *pPushAxisAlignedClip)(void *, const void *, int);
+typedef void (WINAPI *pRtSetTransform)(void *, const my_mat3x2 *);
+typedef void (WINAPI *pRtGetTransform)(void *, my_mat3x2 *);
+static pPushAxisAlignedClip real_PushAxisAlignedClip;
+static pRtSetTransform real_RtSetTransform; static pRtGetTransform real_RtGetTransform;
+static pGetDpi clip_GetDpi;     /* Wine's own GetDpi (the pixel-unit-mode wrapper reports the app's DPI) */
+static LONG g_clip_logs;
+
+static BOOL target_is_command_list(void *ctx)
+{
+    typedef void (WINAPI *pGetTarget)(void *, void **);
+    void *target = NULL, *list = NULL; BOOL ret = FALSE;
+    COM_CALL(ctx, D2D_CTX_GETTARGET, pGetTarget)(ctx, &target);
+    if (!target) return FALSE;
+    if (SUCCEEDED(COM_CALL(target, 0, pUnkQI)(target, &MY_IID_ID2D1CommandList, &list)) && list) {
+        ret = TRUE;
+        COM_CALL(list, 2, pUnkRelease)(list);
+    }
+    COM_CALL(target, 2, pUnkRelease)(target);
+    return ret;
+}
+static void WINAPI my_PushAxisAlignedClip(void *ctx, const void *rect, int antialias)
+{
+    float dx = 96.0f, dy = 96.0f; my_mat3x2 m, t;
+    clip_GetDpi(ctx, &dx, &dy);
+    if ((dx == 96.0f && dy == 96.0f) || !rect) { real_PushAxisAlignedClip(ctx, rect, antialias); return; }
+    real_RtGetTransform(ctx, &m);
+    if ((m._31 == 0.0f && m._32 == 0.0f) || target_is_command_list(ctx)) { real_PushAxisAlignedClip(ctx, rect, antialias); return; }
+    t = m;
+    t._31 *= dx / 96.0f;
+    t._32 *= dy / 96.0f;
+    real_RtSetTransform(ctx, &t);
+    real_PushAxisAlignedClip(ctx, rect, antialias);
+    real_RtSetTransform(ctx, &m);
+    if (InterlockedIncrement(&g_clip_logs) <= 3) OutputDebugStringA("ms365 ole32 shim: translated clip at non-96 DPI corrected");
+}
+static void patch_axis_aligned_clip(void *ctx)
+{
+    void **vt = *(void ***)ctx; DWORD old;
+    if (vt[D2D_RT_PUSHAXISALIGNEDCLIP] == (void *)my_PushAxisAlignedClip) return;
+    if (!VirtualProtect(vt, (D2D_CTX_GETTARGET + 1) * sizeof(void *), PAGE_READWRITE, &old)) return;
+    real_PushAxisAlignedClip = (pPushAxisAlignedClip)vt[D2D_RT_PUSHAXISALIGNEDCLIP];
+    real_RtSetTransform = (pRtSetTransform)vt[D2D_RT_SETTRANSFORM];
+    real_RtGetTransform = (pRtGetTransform)vt[D2D_RT_GETTRANSFORM];
+    clip_GetDpi = (pGetDpi)vt[D2D_RT_GETDPI];
+    vt[D2D_RT_PUSHAXISALIGNEDCLIP] = (void *)my_PushAxisAlignedClip;
+    VirtualProtect(vt, (D2D_CTX_GETTARGET + 1) * sizeof(void *), old, &old);
+    svg_log("ms365 ole32 shim: ID2D1RenderTarget::PushAxisAlignedClip DPI fix installed");
+}
+
 typedef HRESULT (WINAPI *pD2D1CreateFactory)(int, REFIID, const void *, void **);
 static pD2D1CreateFactory real_D2D1CreateFactory;
 static LONG g_svg_vtbl_state;
@@ -1157,6 +1247,7 @@ static void patch_svg_vtable(void *factory)
             VirtualProtect(slot, sizeof(void *), old, &old);
             svg_log("ms365 ole32 shim: SVG patch: ID2D1DeviceContext5::CreateSvgDocument wrapped");
         }
+        patch_axis_aligned_clip(ctx);   /* first: it keeps Wine's own GetDpi */
         patch_unit_mode(ctx);
         COM_CALL(ctx, 2, pUnkRelease)(ctx);
     } else svg_log("ms365 ole32 shim: SVG patch: no ID2D1DeviceContext5");
@@ -1188,6 +1279,7 @@ static const struct patch PATCHES[] = {
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
     { "kernel32.dll", "SetThreadpoolTimerEx",        (void *)my_SetThreadpoolTimerEx },
     { "d2d1.dll",     "D2D1CreateFactory",           (void *)my_D2D1CreateFactory },
+    { "crypt32.dll",  "CertGetCertificateChain",     (void *)my_CertGetCertificateChain },
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
@@ -1203,6 +1295,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "msi.dll", NULL },
     { "user32.dll", NULL },
     { "d2d1.dll", NULL },
+    { "crypt32.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -1268,6 +1361,8 @@ static void note_module(HMODULE h, const char *modname)
             real_CreateWindowExW = (pCreateWindowExW)real_GetProcAddress(h, "CreateWindowExW");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
             real_D2D1CreateFactory = (pD2D1CreateFactory)real_GetProcAddress(h, "D2D1CreateFactory");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "crypt32.dll") == 0) {
+            real_CertGetCertificateChain = (pCertGetCertificateChain)real_GetProcAddress(h, "CertGetCertificateChain");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");
