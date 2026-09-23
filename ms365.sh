@@ -162,8 +162,18 @@ apply_dpi() {
   printf '%s' "$dpi" > "$MS365_PREFIX/.ms365-dpi"
 }
 
+# Windows path of the default save folder: MS365_SAVE_DIR, else X:\ mapped to $HOME (the mapping is
+# created when the prefix has no X: yet), else the home directory through Z: (Wine's /).
+default_save_dir() {
+  if [ -n "${MS365_SAVE_DIR:-}" ]; then printf '%s' "$MS365_SAVE_DIR"; return; fi
+  local root x; root="$(win_prefix_root)"; x="$root/dosdevices/x:"
+  if [ ! -e "$x" ] && [ ! -L "$x" ]; then ln -s "$HOME" "$x" 2>/dev/null || true; fi
+  if [ "$(readlink -f "$x" 2>/dev/null)" = "$(readlink -f "$HOME")" ]; then printf 'X:%s' "\\"; return; fi
+  printf 'Z:%s%s' "${HOME//\//\\}" "\\"
+}
+
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
-REGISTRY_REV=7
+REGISTRY_REV=8
 SHIMS_REV=sppc,ole32,uia,d2d1,appinit,ink,webhttp   # bump when install_shims gains a DLL or an override
 apply_registry() {
   mkdir -p "$ODT_DIR"
@@ -260,6 +270,26 @@ REG
   # other token-based mode; only business subscriptions can use it, a personal one is refused with
   # "cannot be used to activate Office in shared computer scenarios" (0x80004005).
   local sca=0; [ "${MS365_SCA:-0}" = 1 ] && sca=1
+  # Default save/open folder. The file dialogs' "/" branch is Wine's Unix namespace, which Office
+  # refuses as a save location ("You can't save here"); drive letters are real paths. X: is the
+  # home directory (created when missing); MS365_SAVE_DIR overrides, e.g. 'X:\Documents'.
+  local save_dir; save_dir="$(default_save_dir)"
+  local save_reg="${save_dir//\\/\\\\}"
+  cat >> "$reg" <<REG
+
+; Save and open locally, in the home directory, instead of offering OneDrive first.
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Common\\General]
+"PreferCloudSaveLocations"=dword:00000000
+
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Excel\\Options]
+"DefaultPath"="$save_reg"
+
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\Word\\Options]
+"DOC-PATH"="$save_reg"
+
+[HKEY_CURRENT_USER\\Software\\Microsoft\\Office\\16.0\\PowerPoint\\RecentFolderList]
+"Default"="$save_reg"
+REG
   cat >> "$reg" <<REG
 
 [HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Office\\ClickToRun\\Configuration]
