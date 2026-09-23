@@ -28,7 +28,7 @@
 let
   apps = {
     word       = { exe = "WINWORD.EXE";  name = "Microsoft Word";       mime = "application/msword;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/rtf;"; };
-    excel      = { exe = "EXCEL.EXE";    name = "Microsoft Excel";      mime = "application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;text/csv;"; };
+    excel      = { exe = "EXCEL.EXE";    name = "Microsoft Excel";      mime = "application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel.sheet.macroenabled.12;application/vnd.openxmlformats-officedocument.spreadsheetml.template;application/vnd.ms-excel.template.macroenabled.12;application/vnd.ms-excel.sheet.binary.macroenabled.12;text/csv;"; };
     powerpoint = { exe = "POWERPNT.EXE"; name = "Microsoft PowerPoint"; mime = "application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;"; };
     outlook    = { exe = "OUTLOOK.EXE";  name = "Microsoft Outlook";    mime = "message/rfc822;"; };
     onenote    = { exe = "ONENOTE.EXE";  name = "Microsoft OneNote";    mime = ""; };

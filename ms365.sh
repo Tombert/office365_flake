@@ -583,8 +583,16 @@ cmd_run() {
   # teardown race in Wine (null deref in combase) that takes the whole app down.
   local defargs=""
   case "$app" in word) defargs="/q" ;; esac
+  # Files come from file managers and desktop entries as Unix paths; Office needs Windows ones.
+  # Proton maps / to Z:, so an existing file becomes Z:\path\to\file (switches such as /q are not
+  # files and pass through).
+  local args=() a
+  for a in "$@"; do
+    if [ -f "$a" ]; then a="$(realpath -- "$a")"; a="Z:${a//\//\\}"; fi
+    args+=("$a")
+  done
   # shellcheck disable=SC2086
-  exec umu-run "$path" ${MS365_APP_ARGS-$defargs} "$@"
+  exec umu-run "$path" ${MS365_APP_ARGS-$defargs} "${args[@]}"
 }
 
 cmd_winetricks() { umu_env; ensure_prefix; umu winetricks "$@"; }
