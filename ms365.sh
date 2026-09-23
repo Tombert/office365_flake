@@ -582,6 +582,14 @@ cmd_run() {
     log "clearing $regname safe-mode prompt from the last crash"
     umu reg delete "HKCU\\Software\\Microsoft\\Office\\16.0\\$regname\\Resiliency" /f >/dev/null 2>&1 || true
   fi
+  # OneNote keeps its own crash counters and then opens with "How do you want to start OneNote?"
+  # (start normally / delete the notebook cache / delete settings); reset them the same way.
+  if [ "$regname" = OneNote ] && [ "${MS365_KEEP_SAFEMODE_PROMPT:-0}" = 0 ] &&
+     grep -aqE '^"Consecutive(Boot|Early)Crashes"=dword:0*[1-9a-f]' "$root/user.reg" 2>/dev/null; then
+    log "clearing OneNote's crash counters from the last unclean exit"
+    umu reg add 'HKCU\Software\Microsoft\Office\16.0\OneNote\General' /v ConsecutiveBootCrashes /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
+    umu reg add 'HKCU\Software\Microsoft\Office\16.0\OneNote\General' /v ConsecutiveEarlyCrashes /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
+  fi
   # registry tweaks added after the prefix was installed
   if [ "$(cat "$MS365_PREFIX/.ms365-registry" 2>/dev/null)" != "$REGISTRY_REV" ]; then apply_registry; fi
   # Office occasionally resets the product's vNext licensing flag (seen after a failed SKU switch);
