@@ -57,6 +57,15 @@ key installs). The product runs in the same vNext mode as Microsoft 365; at the 
 "Sign in to get started", and signing in with the account the key was redeemed to activates it.
 Verified with a retail Home 2024 key.
 
+**Office LTSC 2024 keys do not work.** LTSC (`ProPlus2024Volume`, `Standard2024Volume`, and the
+cheap "LTSC" keys sold online) is volume licensed. It has no account-based activation: it only
+activates through the Windows Software Protection Platform, with a MAK key checked against
+Microsoft's activation servers or through a KMS host, and Wine does not implement that service
+(`sppc/` is a minimal stand-in that stores licences and refuses key installs). Getting LTSC to
+activate would mean implementing enough of SPP (`sppsvc` and the `SL*` licensing APIs Office calls)
+for Office to install a key, activate it and then validate the licence. **Pull requests for that are
+welcome and encouraged** if you want to give it a try.
+
 **OneNote works** as of 2026-09-23: it starts, signs in, shows the notebook and page lists and the
 page, and edits save. Getting there took four fixes (all in the table below): a start-up crash in
 Office's App-V layer, page text drawn as black boxes, the navigation panes hidden behind a black
