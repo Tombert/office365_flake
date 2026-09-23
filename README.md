@@ -198,6 +198,23 @@ on Wine's `JsonValue`).
 
 ## Known problems
 
+* **Black boxes in Excel's formula bar and next to the sheet tabs.** The strip between the name
+  box and the formula field (where the cancel / enter / fx buttons belong), the expand chevron at
+  the right end of the formula bar, and the splitter between the sheet tabs and the horizontal
+  scroll bar render as black rectangles. They still work: clicking there does the right thing, and
+  Enter / Esc / Shift+F3 cover the formula-bar buttons. What is known so far:
+  - they are GPU (DXVK swapchain) content of small Excel child windows (the formula bar's `EXCEL;`
+    section, the `XLCTL` splitter), which come out black; Wine's Wayland driver passes them through
+    as drawn (a debug build that painted every transparent area of the parent surface magenta
+    covered them too, so nothing of the regular surface above them is lost);
+  - not SVG (Excel creates no SVG documents), not the Direct2D version (GE's own d2d1 shows the
+    same boxes), not a hidden child window; with wined3d instead of DXVK the formula-bar area is
+    blank rather than black (wined3d draws no icons at all), the splitter stays black;
+  - answering `ID2D1RectangleGeometry::CombineWithGeometry`, which Wine stubs and Office calls for
+    the formula bar, makes the black area larger rather than smaller (reverted);
+  - the next step would be a frame capture; RenderDoc 1.46 does not cooperate with GE-Proton 11's
+    DXVK under Wayland here (device creation fails, Wine's explorer does not start), so apitrace on
+    the Direct3D 11 level is the more promising tool. Pull requests welcome.
 * **Proofing categories are mapped by file role.** The Click-to-Run manifests list which qualified
   component categories a language package publishes but not which file each one stands for;
   `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to

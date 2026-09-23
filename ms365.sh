@@ -604,7 +604,10 @@ cmd_run() {
     put_dll "$(ole32_shim_for_runner)" ms365shim.dll
     # a prefix update rewrites Wine's own class registrations; put ours back when they are gone.
     # Also re-run when this version added a DLL override the prefix does not have yet.
-    if ! grep -aqF 'ms365uia' "$root/system.reg" 2>/dev/null || [ "$(cat "$MS365_PREFIX/.ms365-shims" 2>/dev/null)" != "$SHIMS_REV" ]; then
+    # (Proton refreshes the prefix when the runner changes and resets the HKLM class entries, so
+    # check the registrar entry itself rather than any mention of ms365uia.)
+    if ! grep -a -A3 -F '[Software\\Classes\\CLSID\\{6E29FABF-9977-42D1-8D0E-CA7E61AD87E6}\\InprocServer32]' "$root/system.reg" 2>/dev/null | grep -aqF 'ms365uia' ||
+       [ "$(cat "$MS365_PREFIX/.ms365-shims" 2>/dev/null)" != "$SHIMS_REV" ]; then
       log "re-registering shim DLL overrides and COM classes"
       install_shims
     fi
