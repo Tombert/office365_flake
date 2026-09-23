@@ -590,6 +590,12 @@ cmd_run() {
     log "restoring vNext licensing mode for $MS365_PRODUCT"
     apply_registry
   fi
+  # A Proton prefix update (e.g. after switching runners) restores its template's font replacements,
+  # which map Segoe UI back to Times New Roman.
+  if [ -n "${MS365_UI_FONTS:-}" ] && ! grep -aqF '"Segoe UI"="Selawik"' "$root/user.reg" 2>/dev/null; then
+    log "restoring the Segoe UI -> Selawik font mapping"
+    apply_registry
+  fi
   if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
   apply_dpi
   install_ui_fonts
