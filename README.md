@@ -96,6 +96,7 @@ All optional, all environment variables:
 | `MS365_RADV_DEBUG` | unset | AMD driver flags to export as `RADV_DEBUG` (debugging aid, not needed) |
 | `MS365_TRACE_MODULE` | unset | debugging: the shim logs every export lookup into this DLL and every failed lookup (`MS365_DEBUG=1` to see them) |
 | `MS365_WAYLAND` | `1` | Wine's Wayland driver in a Wayland session; `0` for X11/Xwayland (popup menus close instantly there under sway and other wlroots compositors) |
+| `MS365_NO_PIXEL_UNITS` | unset | `1` turns off the shim's Direct2D pixel-unit-mode fix (Excel's formula-bar icons; see "Known problems") |
 | `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver, 96 on X11 |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
@@ -149,6 +150,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | OneNote refuses to start: "You'll need to install the Desktop Experience before you start OneNote" | OneNote checks that the Tablet PC ink object `CLSID_InkDisp` (InkObj.dll) is registered; Wine's `inkobj` is an empty stub, so OneNote concludes it is on Windows Server without the Desktop Experience feature. `ms365uia.dll` (uia-shim/) now also serves an empty `InkDisp` (every ink method `E_NOTIMPL`), registered by the launcher |
 | OneNote runs `SELECT Name FROM Win32_ServerFeature`; Wine's WMI answers with an empty result where client Windows says "invalid class" | the shim wraps `CoCreateInstance(Ex)` for `CLSID_WbemLocator` only and makes that query fail with `WBEM_E_INVALID_CLASS`. OneNote delay-loads `CoCreateInstanceEx` through ntdll's resolver, which the `GetProcAddress` hook never sees, so the shim also fills those delay-load slots up front. Not needed once `InkDisp` is registered, kept as the client-Windows answer |
 | OneNote's navigation pane is blank; its React Native JavaScript thread loops in Office's error reporting (hundreds of thousands of handled access violations a minute) | react-native-win32 builds a `Windows.Web.Http` `HttpBaseProtocolFilter` and `HttpClient` at start; Wine has no `Windows.Web.Http`. The shim serves stand-ins (filter, cache control, client, `HttpMethod`; requests fail with `0x80072EFD` "cannot connect") and exports `DllGetActivationFactory`; the launcher registers them under `WindowsRuntime\ActivatableClassId` with `ms365shim.dll` as `DllPath`. **Experimental, untested** |
+| Excel's formula-bar buttons (name-box ▾, ⋮ grip, cancel / enter / fx, the expand chevron) and the splitter next to the sheet tabs are black boxes, or icons shifted down and cut in half | Office draws those icons as glyphs from its own symbol fonts (`OFFSYM*.TTF`) with Direct2D in pixel unit mode (`D2D1_UNIT_MODE_PIXELS`) on contexts whose DPI it sets to the system DPI. Wine's d2d1 (including 11.16) stores the unit mode but still scales everything by dpi / 96, so at 180 dpi each icon is drawn 1.875 times too large and too far down, mostly outside its box; the empty rest is transparent and shows as black. The shim wraps the device-context vtable: while a context is in pixel mode Wine's DPI is held at 96 and `GetDpi` reports the DPI Office set. `MS365_NO_PIXEL_UNITS=1` turns it off |
 | Segoe UI text (OneNote's canvas and messages, some dialogs) renders in Times New Roman | GE-Proton's prefix template maps Segoe UI to Times New Roman. The flake fetches Selawik (Microsoft's MIT-licensed, metric-compatible stand-in for Segoe UI), the launcher installs it into `windows\Fonts` and maps the Segoe UI family (regular, Semibold, Semilight, Light) to it |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
@@ -198,23 +200,13 @@ on Wine's `JsonValue`).
 
 ## Known problems
 
-* **Black boxes in Excel's formula bar and next to the sheet tabs.** The strip between the name
-  box and the formula field (where the cancel / enter / fx buttons belong), the expand chevron at
-  the right end of the formula bar, and the splitter between the sheet tabs and the horizontal
-  scroll bar render as black rectangles. They still work: clicking there does the right thing, and
-  Enter / Esc / Shift+F3 cover the formula-bar buttons. What is known so far:
-  - they are GPU (DXVK swapchain) content of small Excel child windows (the formula bar's `EXCEL;`
-    section, the `XLCTL` splitter), which come out black; Wine's Wayland driver passes them through
-    as drawn (a debug build that painted every transparent area of the parent surface magenta
-    covered them too, so nothing of the regular surface above them is lost);
-  - not SVG (Excel creates no SVG documents), not the Direct2D version (GE's own d2d1 shows the
-    same boxes), not a hidden child window; with wined3d instead of DXVK the formula-bar area is
-    blank rather than black (wined3d draws no icons at all), the splitter stays black;
-  - answering `ID2D1RectangleGeometry::CombineWithGeometry`, which Wine stubs and Office calls for
-    the formula bar, makes the black area larger rather than smaller (reverted);
-  - the next step would be a frame capture; RenderDoc 1.46 does not cooperate with GE-Proton 11's
-    DXVK under Wayland here (device creation fails, Wine's explorer does not start), so apitrace on
-    the Direct3D 11 level is the more promising tool. Pull requests welcome.
+* **Excel's worksheet may stay blank until the window is resized.** Right after start the cell
+  grid (column and row headers, cells, sheet tabs) can be an empty grey area while the ribbon and
+  formula bar are fine. Resizing the window once (in sway, e.g. toggling fullscreen twice) makes
+  Excel redraw it, and it stays correct afterwards. This showed up together with the pixel-unit-mode
+  fix for the formula-bar icons (see the table above), so it is most likely a side effect of it;
+  before that fix the grid drew at start. `MS365_NO_PIXEL_UNITS=1` switches the fix off (and brings
+  the black formula-bar boxes back).
 * **Proofing categories are mapped by file role.** The Click-to-Run manifests list which qualified
   component categories a language package publishes but not which file each one stands for;
   `msi-components.py` maps them by name (speller and "Normal" dictionary to MSSP*.LEX, grammar to

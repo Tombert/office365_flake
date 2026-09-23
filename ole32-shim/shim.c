@@ -1016,6 +1016,125 @@ static HRESULT WINAPI my_CreateSvgDocument(void *ctx, void *stream, my_size_f vi
     return S_OK;
 }
 
+/* ---- Direct2D: D2D1_UNIT_MODE_PIXELS -----------------------------------------------------------------
+ * In pixel unit mode a device context takes coordinates, sizes and em sizes as pixels, whatever its DPI.
+ * Wine's d2d1 (through at least 11.16) stores the mode but always scales by dpi / 96. Office renders its
+ * symbol-font icons (formula bar, sheet-tab splitter) in pixel mode on contexts whose DPI it sets to the
+ * system DPI, so under Wine they come out dpi/96 times too large and too far from the origin: shifted
+ * down and cut off by their boxes. While a context is in pixel mode, keep Wine's DPI at 96 and report the
+ * DPI the application set; the real unit mode (GetUnitMode) is the source of truth, the table below only
+ * remembers the application's DPI. MS365_NO_PIXEL_UNITS=1 turns this off. */
+#define D2D_RT_RESTOREDRAWINGSTATE 44
+#define D2D_RT_SETDPI              51
+#define D2D_RT_GETDPI              52
+#define D2D_CTX_SETUNITMODE        80
+#define D2D_CTX_GETUNITMODE        81
+#define MY_UNIT_MODE_PIXELS        1
+typedef void (WINAPI *pSetDpi)(void *, float, float);
+typedef void (WINAPI *pGetDpi)(void *, float *, float *);
+typedef void (WINAPI *pSetUnitMode)(void *, int);
+typedef int (WINAPI *pGetUnitMode)(void *);
+typedef void (WINAPI *pRestoreDrawingState)(void *, void *);
+static pSetDpi real_SetDpi; static pGetDpi real_GetDpi;
+static pSetUnitMode real_SetUnitMode; static pGetUnitMode real_GetUnitMode;
+static pRestoreDrawingState real_RestoreDrawingState;
+static struct { void *ctx; float x, y; } g_px_dpi[256];
+static SRWLOCK g_px_lock = SRWLOCK_INIT;
+static LONG g_px_logs;
+
+static void px_store(void *ctx, float x, float y)
+{
+    int free_slot = -1;
+    AcquireSRWLockExclusive(&g_px_lock);
+    for (int i = 0; i < 256; i++) {
+        if (g_px_dpi[i].ctx == ctx) { free_slot = i; break; }
+        if (!g_px_dpi[i].ctx && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { g_px_dpi[free_slot].ctx = ctx; g_px_dpi[free_slot].x = x; g_px_dpi[free_slot].y = y; }
+    ReleaseSRWLockExclusive(&g_px_lock);
+}
+static BOOL px_lookup(void *ctx, float *x, float *y, BOOL remove)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&g_px_lock);
+    for (int i = 0; i < 256; i++) if (g_px_dpi[i].ctx == ctx) {
+        *x = g_px_dpi[i].x; *y = g_px_dpi[i].y; found = TRUE;
+        if (remove) g_px_dpi[i].ctx = NULL;
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_px_lock);
+    return found;
+}
+static void px_log(const char *what, void *ctx, int mode, float x)
+{
+    if (InterlockedIncrement(&g_px_logs) <= 20) {
+        char msg[160];
+        wsprintfA(msg, "ms365 ole32 shim: %s ctx %p unit mode %d app dpi %d", what, ctx, mode, (int)x);
+        OutputDebugStringA(msg);
+    }
+}
+/* the context just switched modes (the real unit mode is already the new one) */
+static void px_enter(void *ctx)
+{
+    float x, y;
+    real_GetDpi(ctx, &x, &y);
+    px_store(ctx, x, y);
+    real_SetDpi(ctx, 96.0f, 96.0f);
+    px_log("pixel unit mode on", ctx, MY_UNIT_MODE_PIXELS, x);
+}
+static void px_leave(void *ctx)
+{
+    float x, y;
+    if (px_lookup(ctx, &x, &y, TRUE)) real_SetDpi(ctx, x, y);
+}
+static void WINAPI my_SetUnitMode(void *ctx, int mode)
+{
+    int old = real_GetUnitMode(ctx);
+    real_SetUnitMode(ctx, mode);
+    mode = real_GetUnitMode(ctx);
+    if (mode == MY_UNIT_MODE_PIXELS && old != MY_UNIT_MODE_PIXELS) px_enter(ctx);
+    else if (mode != MY_UNIT_MODE_PIXELS && old == MY_UNIT_MODE_PIXELS) px_leave(ctx);
+}
+static void WINAPI my_RestoreDrawingState(void *ctx, void *block)
+{
+    int old = real_GetUnitMode(ctx), mode;
+    real_RestoreDrawingState(ctx, block);
+    mode = real_GetUnitMode(ctx);
+    if (mode == MY_UNIT_MODE_PIXELS && old != MY_UNIT_MODE_PIXELS) px_enter(ctx);
+    else if (mode != MY_UNIT_MODE_PIXELS && old == MY_UNIT_MODE_PIXELS) px_leave(ctx);
+}
+static void WINAPI my_SetDpi(void *ctx, float x, float y)
+{
+    if (real_GetUnitMode(ctx) != MY_UNIT_MODE_PIXELS) { real_SetDpi(ctx, x, y); return; }
+    if (x == 0.0f && y == 0.0f) x = y = 96.0f;
+    if (x <= 0.0f || y <= 0.0f) { real_SetDpi(ctx, x, y); return; }   /* let Wine reject it */
+    px_store(ctx, x, y);
+    px_log("SetDpi in pixel unit mode", ctx, MY_UNIT_MODE_PIXELS, x);
+}
+static void WINAPI my_GetDpi(void *ctx, float *x, float *y)
+{
+    if (real_GetUnitMode(ctx) == MY_UNIT_MODE_PIXELS && x && y && px_lookup(ctx, x, y, FALSE)) return;
+    real_GetDpi(ctx, x, y);
+}
+static void patch_unit_mode(void *ctx)
+{
+    void **vt = *(void ***)ctx; DWORD old; char v[4] = "";
+    if (GetEnvironmentVariableA("MS365_NO_PIXEL_UNITS", v, sizeof(v)) && v[0] == '1') return;
+    if (vt[D2D_CTX_SETUNITMODE] == (void *)my_SetUnitMode) return;
+    if (!VirtualProtect(vt, (D2D_CTX_GETUNITMODE + 1) * sizeof(void *), PAGE_READWRITE, &old)) return;
+    real_SetDpi = (pSetDpi)vt[D2D_RT_SETDPI];
+    real_GetDpi = (pGetDpi)vt[D2D_RT_GETDPI];
+    real_SetUnitMode = (pSetUnitMode)vt[D2D_CTX_SETUNITMODE];
+    real_GetUnitMode = (pGetUnitMode)vt[D2D_CTX_GETUNITMODE];
+    real_RestoreDrawingState = (pRestoreDrawingState)vt[D2D_RT_RESTOREDRAWINGSTATE];
+    vt[D2D_RT_SETDPI] = (void *)my_SetDpi;
+    vt[D2D_RT_GETDPI] = (void *)my_GetDpi;
+    vt[D2D_CTX_SETUNITMODE] = (void *)my_SetUnitMode;
+    vt[D2D_RT_RESTOREDRAWINGSTATE] = (void *)my_RestoreDrawingState;
+    VirtualProtect(vt, (D2D_CTX_GETUNITMODE + 1) * sizeof(void *), old, &old);
+    svg_log("ms365 ole32 shim: ID2D1DeviceContext pixel unit mode emulated");
+}
+
 typedef HRESULT (WINAPI *pD2D1CreateFactory)(int, REFIID, const void *, void **);
 static pD2D1CreateFactory real_D2D1CreateFactory;
 static LONG g_svg_vtbl_state;
@@ -1038,6 +1157,7 @@ static void patch_svg_vtable(void *factory)
             VirtualProtect(slot, sizeof(void *), old, &old);
             svg_log("ms365 ole32 shim: SVG patch: ID2D1DeviceContext5::CreateSvgDocument wrapped");
         }
+        patch_unit_mode(ctx);
         COM_CALL(ctx, 2, pUnkRelease)(ctx);
     } else svg_log("ms365 ole32 shim: SVG patch: no ID2D1DeviceContext5");
     COM_CALL(rt, 2, pUnkRelease)(rt);
