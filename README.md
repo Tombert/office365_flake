@@ -33,6 +33,30 @@ The install downloads several GB into `~/.local/share/ms365/odt/Office` and then
 click-to-run installer inside the prefix. Leave the installer window alone; it looks frozen for
 long stretches.
 
+## Optional: Office Home 2024 (retail key)
+
+Microsoft 365 stays the default (`nix run .`, `.#word`, `packages.default`). The flake also packages
+the one-time-purchase **Office Home 2024** as a separate, opt-in output, `.#office2024`: the same
+launcher with the `Home2024Retail` product (Current channel), its own commands and its own prefix in
+`~/.local/share/office2024`, so the two can be installed side by side. Home 2024 is Word, Excel,
+PowerPoint and OneNote.
+
+```sh
+nix run .#office2024 -- winetricks webview2   # the Microsoft sign-in page needs it
+nix run .#office2024 -- install
+nix run .#word2024                            # also .#excel2024 .#powerpoint2024 .#onenote2024
+```
+
+`nix profile install .#office2024` gives `office2024`, `office2024-word`, ... and "Microsoft Word 2024
+(Proton)" style desktop entries. Every `MS365_*` knob below applies too.
+
+Activation: redeem the key at <https://setup.office.com> first, which attaches the licence to your
+Microsoft account. Do not type the key into Office ("I have a product key"): entering a key goes
+through the Windows Software Protection Platform, which Wine does not have (the `sppc/` shim refuses
+key installs). The product runs in the same vNext mode as Microsoft 365; at the first start Word shows
+"Sign in to get started", and signing in with the account the key was redeemed to activates it.
+Verified with a retail Home 2024 key.
+
 ## Knobs
 
 All optional, all environment variables:
@@ -100,6 +124,9 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |
 | Ribbon font/size boxes, Comments/Editing/Share buttons and the title-bar search field are solid grey blocks; a control only shows its text while hovered, icons vanish under the hover highlight | GE-Proton 11's Wine (11.0 base) ships a `d2d1` that ignores the fill mode of geometry groups. Office draws each control's border as two nested rounded rectangles with even-odd fill (a ring); Wine fills the union, and the compositor stretches that slab over the text. `d2d1-fix/` ships `d2d1.dll` from nixpkgs' Wine 11.16 (fixed upstream in February 2026) with its builtin signature blanked so Proton loads it, registered as a native override. |
 | Dialogs (e.g. "save changes?") make the whole window flicker and the document area draw at the wrong scale on the Wayland driver; Excel shows black crosshair lines across the window | Office draws dialog shadows with unowned layered `MSO_BORDEREFFECT_WINDOW_CLASS` popups; the Wayland driver makes each an independent toplevel, sway tiles them and the layout reshuffles until the dialog closes. The shim gives those windows an owner (the active window), so they become transient and float |
+| Thin lines across the middle of the screen on the Wayland driver (a vertical and a horizontal one through a maximized Word) | those are the same shadow strips, floated: a Wayland client cannot position its toplevels, so sway centres each one. On the Wayland driver the shim also subclasses the strips and drops `SWP_SHOWWINDOW` in `WM_WINDOWPOSCHANGING`, so they never show; Office just has no window shadows |
+| Office Home 2024 install: `setup.exe` aborts half a second in, no log (exit 3) | for consumer SKUs the ODT bootstrapper asks the WinRT `PackageManager` whether Office is installed from the Store and aborts when the class cannot be activated. Wine's `appxdeploymentclient` answers that query, so it is enabled for `setup.exe` only (`AppDefaults\setup.exe\DllOverrides`); `OfficeClickToRun.exe` keeps it disabled (see the LastRun row above) |
+| Word exits with code 64 a second after start, before the "Sign in to get started" dialog can open | the dialog (react-native-win32) draws its icons with `ID2D1DeviceContext5::CreateSvgDocument`, a stub returning `E_NOTIMPL` in Wine's d2d1; Office writes through the missing document. The shim wraps `D2D1CreateFactory` (Office links it as `d2d1 #1`) and on the first call patches the device-context vtable so `CreateSvgDocument` falls back to an empty document that accepts everything and draws nothing. The dialog works, its two icons are blank |
 | "Missing proofing tools" banner and no spell checking although the dictionaries are installed | Office finds its proofing tools through the Windows Installer API (component paths, feature states, "qualified components" per category and language), registrations the Click-to-Run integrator never writes under Wine. `msi-components.py` rebuilds all of them from the package manifests, and the ole32 shim answers the MSI calls Office makes with an empty product code (its "whichever package owns it" convention, imported by ordinal) from the registered products |
 
 Debug aids: `MS365_DEBUG=1` writes Proton's Wine log with `+seh`; `MS365_DEBUG=1 PROTON_LOG="+module"`
@@ -137,7 +164,9 @@ What has been verified: sign-in completes, Word shows the account's OneDrive doc
 fetches the account's entitlements. What has not: an actual licence, because the test account had
 no Microsoft 365 subscription that includes the desktop apps. In that case Office tries to open its
 in-app purchase dialog, a WebView2 window in DirectComposition mode, and Wine's DirectComposition is
-a stub, so Word exits with code 64 instead. Buy or manage the subscription on the web, then sign in
+a stub, so Word exits with code 64 instead. (Exit 64 is Office's crash handler; the licensing dialog's
+SVG icons were a confirmed cause of it for Office 2024, fixed in the shim, see the table above, so this
+may have been the same crash.) Buy or manage the subscription on the web, then sign in
 again in Word.
 
 Other WinRT gaps the ole32 shim fills for the licensing code: `Windows.Globalization.Language`

@@ -511,7 +511,12 @@ static INSTALLSTATE WINAPI my_MsiGetComponentPathW(LPCWSTR product, LPCWSTR comp
  * Give those strips an owner (the active window, i.e. the one being decorated), which makes them
  * transient windows: positioned relative to the owner and floated by the compositor. Only on the
  * Wayland driver: on X11 the owner change makes Office raise its fatal assertion (0xe0000002) a
- * second later, and X11 has no need for it. MS365_OWN_BORDERS=0/1 overrides. */
+ * second later, and X11 has no need for it. MS365_OWN_BORDERS=0/1 overrides.
+ * Floating still is not enough: a Wayland client cannot place its toplevels, so sway centres each
+ * strip on the output and a maximized window's right and bottom shadows become a cross-hair through
+ * the middle of the screen. So the strips are also kept hidden: showing a window always goes through
+ * SetWindowPos, which sends WM_WINDOWPOSCHANGING before the visibility changes, and the subclassed
+ * strip drops SWP_SHOWWINDOW there. Office loses its window shadows, nothing else. */
 typedef HWND (WINAPI *pCreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static pCreateWindowExW real_CreateWindowExW; static LONG g_border_logs; static int g_own_borders = -1;
 static int own_borders(void)
@@ -542,22 +547,231 @@ static HWND decorated_window(HWND self)
     if (!owner || owner == self) { owner = NULL; EnumThreadWindows(GetCurrentThreadId(), find_main_window, (LPARAM)&owner); }
     return owner != self ? owner : NULL;
 }
+static const WCHAR BORDER_PROC_PROP[] = L"ms365.borderproc";
+static LRESULT CALLBACK border_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, BORDER_PROC_PROP);
+    LRESULT r = orig ? CallWindowProcW(orig, hwnd, msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
+    if (msg == WM_WINDOWPOSCHANGING && lp) ((WINDOWPOS *)lp)->flags &= ~SWP_SHOWWINDOW;
+    else if (msg == WM_NCDESTROY) RemovePropW(hwnd, BORDER_PROC_PROP);
+    return r;
+}
 static HWND WINAPI my_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
 {
     HWND hwnd = real_CreateWindowExW(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
     if (hwnd && !parent && (style & WS_POPUP) && (ex & WS_EX_LAYERED) && own_borders()) {
         WCHAR cn[64];
         if (GetClassNameW(hwnd, cn, 64) && lstrcmpiW(cn, L"MSO_BORDEREFFECT_WINDOW_CLASS") == 0) {
+            WNDPROC orig = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+            if (orig && orig != border_wndproc && SetPropW(hwnd, BORDER_PROC_PROP, (HANDLE)orig))
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)border_wndproc);
+            if (style & WS_VISIBLE) ShowWindow(hwnd, SW_HIDE);
             HWND owner = decorated_window(hwnd);
             if (owner) {
                 SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, (LONG_PTR)owner);
                 if (InterlockedIncrement(&g_border_logs) <= 20) {
-                    char msg[160]; wsprintfA(msg, "ms365 ole32 shim: border-effect window %p owned by %p", hwnd, owner); OutputDebugStringA(msg);
+                    char msg[160]; wsprintfA(msg, "ms365 ole32 shim: border-effect window %p owned by %p, kept hidden", hwnd, owner); OutputDebugStringA(msg);
                 }
             }
         }
     }
     return hwnd;
+}
+
+/* ---- Direct2D SVG documents -------------------------------------------------------------------
+ * Office's licensing / activation dialog draws its icons with ID2D1DeviceContext5::CreateSvgDocument.
+ * Wine's d2d1 has that as a stub returning E_NOTIMPL; Office does not check and writes through the
+ * missing document (access violation in mso20win32client, Word exits with code 64 before the sign-in
+ * page can open). The first D2D1CreateFactory call patches the device-context vtable (shared by
+ * every context in the process) so CreateSvgDocument falls back to an empty document: it parses
+ * nothing, has one root element that accepts any attribute, and draws nothing (Wine's
+ * DrawSvgDocument is a no-op). The icons stay blank, the dialog works. */
+typedef struct { float width, height; } my_size_f;
+static const GUID MY_IID_IUnknown         = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID MY_IID_ID2D1Resource    = { 0x2cd90691, 0x12e2, 0x11dc, { 0x9f, 0xed, 0x00, 0x11, 0x43, 0xa0, 0x55, 0xf9 } };
+static const GUID MY_IID_ID2D1SvgDocument = { 0x86b88e4d, 0xafa4, 0x4d7b, { 0x88, 0xe4, 0x68, 0xa5, 0x1c, 0x4a, 0x0a, 0xec } };
+static const GUID MY_IID_ID2D1SvgElement  = { 0xac7b67a6, 0x183e, 0x49c1, { 0xa8, 0x23, 0x0e, 0xbe, 0x40, 0xb0, 0xdb, 0x29 } };
+static const GUID MY_IID_ID2D1DeviceContext5 = { 0x7836d248, 0x68cc, 0x4df6, { 0xb9, 0xe8, 0xde, 0x99, 0x1b, 0xf6, 0x2e, 0xb7 } };
+#define D2D_CTX_GETFACTORY        3
+#define D2D_CTX_CREATESVGDOCUMENT 115   /* ID2D1DeviceContext6 vtable slot (Wine dlls/d2d1/device.c) */
+#define D2D_FACTORY_CREATEDCRT    16    /* ID2D1Factory::CreateDCRenderTarget */
+#define COM_CALL(obj, idx, type)  ((type)((*(void ***)(obj))[idx]))
+typedef ULONG (WINAPI *pUnkRelease)(void *);
+typedef HRESULT (WINAPI *pUnkQI)(void *, REFIID, void **);
+
+struct svg_doc;
+struct svg_elem { void *const *vtbl; LONG ref; struct svg_doc *doc; };  /* ref unused for the root */
+struct svg_doc  { void *const *vtbl; LONG ref; void *factory; my_size_f viewport; struct svg_elem root; };
+static LONG g_svg_logs;
+static void svg_log(const char *msg) { if (InterlockedIncrement(&g_svg_logs) <= 20) OutputDebugStringA(msg); }
+
+static ULONG WINAPI svgdoc_AddRef(struct svg_doc *d) { return InterlockedIncrement(&d->ref); }
+static ULONG WINAPI svgdoc_Release(struct svg_doc *d)
+{
+    LONG r = InterlockedDecrement(&d->ref);
+    if (!r) { if (d->factory) COM_CALL(d->factory, 2, pUnkRelease)(d->factory); HeapFree(GetProcessHeap(), 0, d); }
+    return r;
+}
+static HRESULT WINAPI svgdoc_QueryInterface(struct svg_doc *d, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, &MY_IID_IUnknown) || IsEqualGUID(iid, &MY_IID_ID2D1Resource) || IsEqualGUID(iid, &MY_IID_ID2D1SvgDocument)) {
+        svgdoc_AddRef(d); *out = d; return S_OK;
+    }
+    *out = NULL; return E_NOINTERFACE;
+}
+static void WINAPI svg_GetFactory_doc(struct svg_doc *d, void **factory)
+{
+    if (!factory) return;
+    *factory = d->factory;
+    if (d->factory) COM_CALL(d->factory, 1, pUnkRelease)(d->factory); /* AddRef shares Release's signature */
+}
+
+/* elements: the root lives inside its document and shares its refcount; CreateChild makes
+ * standalone ones that hold a document reference */
+static ULONG WINAPI svgel_AddRef(struct svg_elem *e) { return e == &e->doc->root ? svgdoc_AddRef(e->doc) : (ULONG)InterlockedIncrement(&e->ref); }
+static ULONG WINAPI svgel_Release(struct svg_elem *e)
+{
+    if (e == &e->doc->root) return svgdoc_Release(e->doc);
+    LONG r = InterlockedDecrement(&e->ref);
+    if (!r) { svgdoc_Release(e->doc); HeapFree(GetProcessHeap(), 0, e); }
+    return r;
+}
+static HRESULT WINAPI svgel_QueryInterface(struct svg_elem *e, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, &MY_IID_IUnknown) || IsEqualGUID(iid, &MY_IID_ID2D1Resource) || IsEqualGUID(iid, &MY_IID_ID2D1SvgElement)) {
+        svgel_AddRef(e); *out = e; return S_OK;
+    }
+    *out = NULL; return E_NOINTERFACE;
+}
+static void WINAPI svgel_GetFactory(struct svg_elem *e, void **factory) { svg_GetFactory_doc(e->doc, factory); }
+static void *const svgel_vtbl[34];
+static struct svg_elem *svgel_new(struct svg_doc *d)
+{
+    struct svg_elem *e = HeapAlloc(GetProcessHeap(), 0, sizeof(*e));
+    if (!e) return NULL;
+    e->vtbl = svgel_vtbl; e->ref = 1; e->doc = d; svgdoc_AddRef(d);
+    return e;
+}
+static void WINAPI svgel_GetDocument(struct svg_elem *e, void **doc) { if (doc) { svgdoc_AddRef(e->doc); *doc = e->doc; } }
+static void WINAPI svgel_out_null(struct svg_elem *e, void **out) { (void)e; if (out) *out = NULL; }                    /* GetParent/GetFirstChild/GetLastChild */
+static HRESULT WINAPI svgel_sibling(struct svg_elem *e, void *child, void **out) { (void)e; (void)child; if (out) *out = NULL; return E_INVALIDARG; }
+static HRESULT WINAPI svgel_ok(void) { return S_OK; }                    /* tree edits, attribute/text setters */
+static HRESULT WINAPI svgel_fail(void) { return E_INVALIDARG; }          /* getters that fill caller buffers: "not set" */
+static UINT32 WINAPI svgel_zero(void) { return 0; }                      /* lengths, counts, BOOL queries */
+static BOOL WINAPI svgel_IsAttributeSpecified(struct svg_elem *e, LPCWSTR name, BOOL *inherited) { (void)e; (void)name; if (inherited) *inherited = FALSE; return FALSE; }
+static HRESULT WINAPI svgel_CreateChild(struct svg_elem *e, LPCWSTR tag, void **out)
+{
+    (void)tag;
+    if (!out) return E_POINTER;
+    *out = svgel_new(e->doc);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+/* ID2D1SvgElement (d2d1svg.h). The overloaded Set/GetAttributeValue slots all get the same
+ * behaviour, so MSVC's ordering of overloads does not matter. */
+static void *const svgel_vtbl[34] = {
+    svgel_QueryInterface, svgel_AddRef, svgel_Release, svgel_GetFactory,
+    svgel_GetDocument,
+    svgel_fail,                  /* GetTagName */
+    svgel_zero,                  /* GetTagNameLength */
+    svgel_zero,                  /* IsTextContent */
+    svgel_out_null,              /* GetParent */
+    svgel_zero,                  /* HasChildren */
+    svgel_out_null,              /* GetFirstChild */
+    svgel_out_null,              /* GetLastChild */
+    svgel_sibling,               /* GetPreviousChild */
+    svgel_sibling,               /* GetNextChild */
+    svgel_ok, svgel_ok, svgel_ok, svgel_ok,   /* InsertChildBefore, AppendChild, ReplaceChild, RemoveChild */
+    svgel_CreateChild,
+    svgel_IsAttributeSpecified,
+    svgel_zero,                  /* GetSpecifiedAttributeCount */
+    svgel_fail, svgel_fail,      /* GetSpecifiedAttributeName, GetSpecifiedAttributeNameLength */
+    svgel_ok,                    /* RemoveAttribute */
+    svgel_ok,                    /* SetTextValue */
+    svgel_fail,                  /* GetTextValue */
+    svgel_zero,                  /* GetTextValueLength */
+    svgel_ok, svgel_ok, svgel_ok,             /* SetAttributeValue x3 */
+    svgel_fail, svgel_fail, svgel_fail,       /* GetAttributeValue x3 */
+    svgel_fail,                  /* GetAttributeValueLength */
+};
+
+static HRESULT WINAPI svgdoc_SetViewportSize(struct svg_doc *d, my_size_f size) { d->viewport = size; return S_OK; }
+/* MSVC returns structs from member functions through a hidden pointer after `this` */
+static my_size_f *WINAPI svgdoc_GetViewportSize(struct svg_doc *d, my_size_f *ret) { *ret = d->viewport; return ret; }
+static HRESULT WINAPI svgdoc_SetRoot(struct svg_doc *d, void *root) { (void)d; (void)root; return S_OK; }
+static void WINAPI svgdoc_GetRoot(struct svg_doc *d, void **root) { if (root) { svgdoc_AddRef(d); *root = &d->root; } }
+static HRESULT WINAPI svgdoc_FindElementById(struct svg_doc *d, LPCWSTR id, void **out) { (void)d; (void)id; if (out) *out = NULL; return S_OK; }
+static HRESULT WINAPI svgdoc_Serialize(struct svg_doc *d, void *stream, void *subtree) { (void)d; (void)stream; (void)subtree; return E_NOTIMPL; }
+static HRESULT WINAPI svgdoc_Deserialize(struct svg_doc *d, void *stream, void **subtree)
+{
+    (void)stream;
+    if (!subtree) return E_POINTER;
+    *subtree = svgel_new(d);
+    return *subtree ? S_OK : E_OUTOFMEMORY;
+}
+static HRESULT WINAPI svgdoc_out4(struct svg_doc *d, void *a, void *b, void *c, void **out) { (void)d; (void)a; (void)b; (void)c; if (out) *out = NULL; return E_NOTIMPL; }
+static HRESULT WINAPI svgdoc_out3(struct svg_doc *d, void *a, UINT32 b, void **out) { (void)d; (void)a; (void)b; if (out) *out = NULL; return E_NOTIMPL; }
+static HRESULT WINAPI svgdoc_CreatePathData(struct svg_doc *d, void *a, UINT32 b, void *c, UINT32 e, void **out) { (void)d; (void)a; (void)b; (void)c; (void)e; if (out) *out = NULL; return E_NOTIMPL; }
+/* ID2D1SvgDocument (d2d1svg.h) */
+static void *const svgdoc_vtbl[15] = {
+    svgdoc_QueryInterface, svgdoc_AddRef, svgdoc_Release, svg_GetFactory_doc,
+    svgdoc_SetViewportSize, svgdoc_GetViewportSize, svgdoc_SetRoot, svgdoc_GetRoot,
+    svgdoc_FindElementById, svgdoc_Serialize, svgdoc_Deserialize,
+    svgdoc_out4,                 /* CreatePaint(type, color, id, paint) */
+    svgdoc_out3,                 /* CreateStrokeDashArray(dashes, count, array) */
+    svgdoc_out3,                 /* CreatePointCollection(points, count, collection) */
+    svgdoc_CreatePathData,
+};
+
+typedef HRESULT (WINAPI *pCreateSvgDocument)(void *, void *, my_size_f, void **);
+static pCreateSvgDocument real_CreateSvgDocument;
+static HRESULT WINAPI my_CreateSvgDocument(void *ctx, void *stream, my_size_f viewport, void **out)
+{
+    HRESULT hr = real_CreateSvgDocument ? real_CreateSvgDocument(ctx, stream, viewport, out) : E_NOTIMPL;
+    if (hr != E_NOTIMPL || !out) return hr;   /* a Wine that implements SVG answers for itself */
+    struct svg_doc *d = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*d));
+    if (!d) { *out = NULL; return E_OUTOFMEMORY; }
+    d->vtbl = svgdoc_vtbl; d->ref = 1; d->viewport = viewport;
+    d->root.vtbl = svgel_vtbl; d->root.doc = d;
+    typedef void (WINAPI *pGetFactory)(void *, void **);
+    COM_CALL(ctx, D2D_CTX_GETFACTORY, pGetFactory)(ctx, &d->factory);   /* keeps the reference */
+    svg_log("ms365 ole32 shim: CreateSvgDocument answered with an empty SVG document");
+    *out = d;
+    return S_OK;
+}
+
+typedef HRESULT (WINAPI *pD2D1CreateFactory)(int, REFIID, const void *, void **);
+static pD2D1CreateFactory real_D2D1CreateFactory;
+static LONG g_svg_vtbl_state;
+static void patch_svg_vtable(void *factory)
+{
+    if (InterlockedCompareExchange(&g_svg_vtbl_state, 1, 0) != 0) return;
+    /* any device context will do: a DC render target owns one (D2D1_RENDER_TARGET_PROPERTIES:
+     * default type, B8G8R8A8_UNORM premultiplied, default dpi/usage/feature level) */
+    struct { int type, format, alpha; float dpix, dpiy; int usage, minlevel; } props = { 0, 87, 1, 0.0f, 0.0f, 0, 0 };
+    typedef HRESULT (WINAPI *pCreateDCRenderTarget)(void *, const void *, void **);
+    void *rt = NULL, *ctx = NULL;
+    HRESULT hr = COM_CALL(factory, D2D_FACTORY_CREATEDCRT, pCreateDCRenderTarget)(factory, &props, &rt);
+    if (FAILED(hr) || !rt) { svg_log("ms365 ole32 shim: SVG patch: CreateDCRenderTarget failed"); return; }
+    if (SUCCEEDED(COM_CALL(rt, 0, pUnkQI)(rt, &MY_IID_ID2D1DeviceContext5, &ctx)) && ctx) {
+        void **slot = &(*(void ***)ctx)[D2D_CTX_CREATESVGDOCUMENT];
+        DWORD old;
+        if (*slot != (void *)my_CreateSvgDocument && VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) {
+            real_CreateSvgDocument = (pCreateSvgDocument)*slot;
+            *slot = (void *)my_CreateSvgDocument;
+            VirtualProtect(slot, sizeof(void *), old, &old);
+            svg_log("ms365 ole32 shim: SVG patch: ID2D1DeviceContext5::CreateSvgDocument wrapped");
+        }
+        COM_CALL(ctx, 2, pUnkRelease)(ctx);
+    } else svg_log("ms365 ole32 shim: SVG patch: no ID2D1DeviceContext5");
+    COM_CALL(rt, 2, pUnkRelease)(rt);
+}
+static HRESULT WINAPI my_D2D1CreateFactory(int type, REFIID iid, const void *opts, void **out)
+{
+    HRESULT hr = real_D2D1CreateFactory ? real_D2D1CreateFactory(type, iid, opts, out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out && *out) patch_svg_vtable(*out);
+    return hr;
 }
 
 static const struct patch PATCHES[] = {
@@ -578,6 +792,7 @@ static const struct patch PATCHES[] = {
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
     { "kernel32.dll", "SetThreadpoolTimerEx",        (void *)my_SetThreadpoolTimerEx },
+    { "d2d1.dll",     "D2D1CreateFactory",           (void *)my_D2D1CreateFactory },
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
@@ -592,6 +807,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "api-ms-win-core-winrt-l1-1-0.dll", NULL },
     { "msi.dll", NULL },
     { "user32.dll", NULL },
+    { "d2d1.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -603,6 +819,8 @@ static const char *ordinal_name(const char *dll, WORD ordinal)
         if (ordinal == 173) return "MsiGetComponentPathW";
         if (ordinal == 294) return "MsiGetComponentPathExW";
     }
+    /* react-native-win32 (the licensing dialog) links d2d1 #1, D2D1CreateFactory in both d2d1s */
+    if (lstrcmpiA(dll, "d2d1.dll") == 0 && ordinal == 1) return "D2D1CreateFactory";
     return NULL;
 }
 static const struct patch *wrapped_lookup(HMODULE h, LPCSTR name)
@@ -653,6 +871,8 @@ static void note_module(HMODULE h, const char *modname)
             real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "user32.dll") == 0) {
             real_CreateWindowExW = (pCreateWindowExW)real_GetProcAddress(h, "CreateWindowExW");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
+            real_D2D1CreateFactory = (pD2D1CreateFactory)real_GetProcAddress(h, "D2D1CreateFactory");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");

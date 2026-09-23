@@ -2,6 +2,7 @@
 # Sourced into a writeShellApplication wrapper (set -euo pipefail already on).
 # MS365_PROTON_GE / MS365_PROTOSODA are injected by the Nix wrapper.
 
+: "${MS365_CLI:=ms365}"                   # command name shown in messages (the Nix wrapper sets it)
 : "${MS365_HOME:=$HOME/.local/share/ms365}"
 : "${MS365_PREFIX:=$MS365_HOME/prefix}"
 : "${MS365_RUNNER:=ge}"                    # ge | protosoda | /path/to/any/proton/dir
@@ -162,7 +163,7 @@ apply_dpi() {
 }
 
 # bump when apply_registry changes so existing prefixes pick the new tweaks up on the next run
-REGISTRY_REV=5
+REGISTRY_REV=6
 SHIMS_REV=sppc,ole32,uia,d2d1,appinit   # bump when install_shims gains a DLL or an override
 apply_registry() {
   mkdir -p "$ODT_DIR"
@@ -186,6 +187,12 @@ Windows Registry Editor Version 5.00
 [HKEY_CURRENT_USER\Software\Wine\DllOverrides]
 "appxdeploymentclient"=""
 "hvsimanagementapi"=""
+
+; The ODT bootstrapper itself (setup.exe), for consumer SKUs such as Home2024Retail, asks the WinRT
+; PackageManager whether Office is installed from the Store and aborts when the class cannot be
+; activated at all. Wine's stub answers that query well enough, so give it to setup.exe only.
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\setup.exe\DllOverrides]
+"appxdeploymentclient"="builtin"
 
 ; Verbose Windows Installer logs (MSI*.log in %TEMP%) so integrator MSI failures are diagnosable.
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Installer]
@@ -452,7 +459,7 @@ cmd_install() {
   post_install_fixups
   if [ -f "$OFFICE_ROOT/WINWORD.EXE" ]; then
     log "Office binaries present in $OFFICE_ROOT"
-    log "Try:  ms365 run word"
+    log "Try:  $MS365_CLI run word"
   else
     warn "WINWORD.EXE not found after install; check $LOG_DIR and $ODT_DIR/logs"
     exit 2
@@ -472,7 +479,7 @@ cmd_run() {
   umu_env
   local root; root="$(win_prefix_root)"
   local path="$root/drive_c/Program Files/Microsoft Office/root/Office16/$exe"
-  [ -f "$path" ] || die "$exe not installed (expected $path). Run: ms365 install"
+  [ -f "$path" ] || die "$exe not installed (expected $path). Run: $MS365_CLI install"
   # Office holds ClickToRunPackageLocker at mode 000 (a Windows deny-ACL that Wine maps to no Unix
   # permission bits) while it runs, and resets it on a clean exit. After a crash or a kill -- routine
   # under Wine -- it is left at 000, and the next launch cannot open it, so Click-to-Run aborts with
@@ -560,7 +567,7 @@ cmd_status() {
 }
 
 cmd_reset() {
-  [ "${1:-}" = "--yes" ] || die "this deletes $MS365_PREFIX ; rerun with: ms365 reset --yes"
+  [ "${1:-}" = "--yes" ] || die "this deletes $MS365_PREFIX ; rerun with: $MS365_CLI reset --yes"
   cmd_kill
   rm -rf "$MS365_PREFIX"
   log "prefix removed (ODT payload in $ODT_DIR kept; delete it yourself if you want a clean download)"
@@ -568,22 +575,22 @@ cmd_reset() {
 
 usage() {
   cat <<USG
-ms365 -- Microsoft 365 through umu-launcher + Proton
+$MS365_CLI -- Office ($MS365_PRODUCT) through umu-launcher + Proton
 
-  ms365 install [download|configure|fixup]
+  $MS365_CLI install [download|configure|fixup]
                                       create prefix, winetricks, fetch ODT, download + install Office
                                       (a single phase reruns just that step; fixup = post-install DLL copies)
-  ms365 run <app> [files...]          word excel powerpoint outlook onenote access publisher
-  ms365 winetricks <verbs...>         run winetricks verbs in the prefix
-  ms365 exec <exe|cmd> [args...]      run any exe (or wine builtin: cmd, regedit, winecfg, control)
-  ms365 status                        show configuration and what is installed
-  ms365 kill                          stop the wineserver for this prefix
-  ms365 reset --yes                   delete the prefix
+  $MS365_CLI run <app> [files...]     word excel powerpoint outlook onenote access publisher
+  $MS365_CLI winetricks <verbs...>    run winetricks verbs in the prefix
+  $MS365_CLI exec <exe|cmd> [args...] run any exe (or wine builtin: cmd, regedit, winecfg, control)
+  $MS365_CLI status                   show configuration and what is installed
+  $MS365_CLI kill                     stop the wineserver for this prefix
+  $MS365_CLI reset --yes              delete the prefix
 
 Environment (all optional):
   MS365_RUNNER    ge (GE-Proton from nixpkgs, default) | protosoda (Bottles Soda core) | /abs/path
-  MS365_PREFIX    prefix directory  (default ~/.local/share/ms365/prefix)
-  MS365_PRODUCT   ODT product id    (default O365ProPlusRetail)
+  MS365_PREFIX    prefix directory  (default $MS365_HOME/prefix)
+  MS365_PRODUCT   ODT product id    (default here: $MS365_PRODUCT)
   MS365_CHANNEL   update channel    (default Current)
   MS365_VERSION   pin an Office build, e.g. 16.0.18129.20158
   MS365_EDITION   64 | 32           (default 64)
@@ -591,7 +598,7 @@ Environment (all optional):
   MS365_EXCLUDE   ExcludeApp ids    (default "Teams OneDrive Lync Bing Groove")
   MS365_WINETRICKS verbs applied before install (default "corefonts msxml6 riched20 gdiplus")
   MS365_ODT_SETUP path to a local ODT setup.exe instead of downloading
-  MS365_DEBUG=1   write Proton/Wine debug log to ~/.local/share/ms365/logs/
+  MS365_DEBUG=1   write Proton/Wine debug log to $MS365_HOME/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
   MS365_RADV_DEBUG=<flags>  AMD driver debug flags to export as RADV_DEBUG (default: none)

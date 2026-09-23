@@ -15,6 +15,13 @@
 , ole32ShimSoda
 , uiaShim
 , d2d1Fix
+  # Variant knobs: the same launcher, packaged under another command name with other defaults
+  # (e.g. a retail Office 2024 SKU in its own prefix next to Microsoft 365).
+, cliName ? "ms365"
+, description ? "Run Microsoft 365 click-to-run Office through umu-launcher and GE-Proton"
+, desktopSuffix ? " (Proton)"     # appended to each .desktop entry's name
+, only ? null                     # null = every app below; else a list of app keys to ship wrappers for
+, defaults ? { }                  # MS365_* defaults baked in; the environment still overrides them
 }:
 
 let
@@ -28,10 +35,16 @@ let
     publisher  = { exe = "MSPUB.EXE";    name = "Microsoft Publisher";  mime = "application/vnd.ms-publisher;"; };
   };
 
+  shippedApps = if only == null then apps else lib.getAttrs only apps;
+
+  defaultsSh = lib.concatStrings (lib.mapAttrsToList (k: v: ": \"\${${k}:=${v}}\"\n") defaults);
+
   cli = writeShellApplication {
-    name = "ms365";
+    name = cliName;
     runtimeInputs = [ umu-launcher curl coreutils gnused python3 ];
     text = ''
+      : "''${MS365_CLI:=${cliName}}"
+      ${defaultsSh}
       MS365_PROTON_GE=${protonGE}
       MS365_PROTOSODA=${protosoda}
       MS365_SPPC_SHIM=${sppcShim}/lib/wine/x86_64-windows/sppc.dll
@@ -46,29 +59,29 @@ let
   };
 
   appWrappers = lib.mapAttrsToList (key: app: writeShellApplication {
-    name = "ms365-${key}";
+    name = "${cliName}-${key}";
     runtimeInputs = [ cli ];
-    text = ''exec ms365 run ${key} "$@"'';
-  }) apps;
+    text = ''exec ${cliName} run ${key} "$@"'';
+  }) shippedApps;
 
   desktopItems = lib.mapAttrsToList (key: app: makeDesktopItem {
-    name = "ms365-${key}";
-    desktopName = "${app.name} (Proton)";
+    name = "${cliName}-${key}";
+    desktopName = "${app.name}${desktopSuffix}";
     genericName = app.name;
-    exec = "ms365-${key} %F";
-    icon = "ms365-${key}";
+    exec = "${cliName}-${key} %F";
+    icon = "${cliName}-${key}";
     terminal = false;
     categories = [ "Office" ];
     mimeTypes = lib.filter (s: s != "") (lib.splitString ";" app.mime);
     startupNotify = true;
-  }) apps;
+  }) shippedApps;
 in
 symlinkJoin {
-  name = "ms365";
+  name = cliName;
   paths = [ cli ] ++ appWrappers ++ desktopItems;
   meta = {
-    description = "Run Microsoft 365 click-to-run Office through umu-launcher and GE-Proton";
-    mainProgram = "ms365";
+    inherit description;
+    mainProgram = cliName;
     platforms = [ "x86_64-linux" ];
   };
 }

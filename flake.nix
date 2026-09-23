@@ -66,16 +66,35 @@
       # newer Direct2D for both runners' Wine 11.0 base (ribbon controls rendered as grey blocks)
       d2d1Fix = pkgs.callPackage ./d2d1-fix { wine = pkgs.wine64Packages.unstable; };
 
-      ms365 = pkgs.callPackage ./ms365.nix {
-        inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
-      };
+      launcherDeps = { inherit protonGE protosoda sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix; };
+
+      ms365 = pkgs.callPackage ./ms365.nix launcherDeps;
+
+      # Office Home 2024, the retail one-time purchase: the same launcher with the retail SKU, in its
+      # own prefix so it can sit next to a Microsoft 365 install. Retail 2024 builds come from the
+      # Current channel. The product key is not given to the installer (Wine has no Software
+      # Protection Platform to hold it); a key redeemed at setup.office.com is attached to the
+      # Microsoft account, and Office licenses itself from that account after sign-in (vNext).
+      # Home 2024 is Word, Excel, PowerPoint and OneNote.
+      office2024 = pkgs.callPackage ./ms365.nix (launcherDeps // {
+        cliName = "office2024";
+        description = "Run Office Home 2024 (retail) through umu-launcher and GE-Proton";
+        desktopSuffix = " 2024 (Proton)";
+        only = [ "word" "excel" "powerpoint" "onenote" ];
+        defaults = {
+          MS365_HOME = "$HOME/.local/share/office2024";
+          MS365_PRODUCT = "Home2024Retail";
+          MS365_CHANNEL = "Current";
+        };
+      });
 
       mkApp = exe: { type = "app"; program = "${ms365}/bin/${exe}"; };
+      mkApp2024 = exe: { type = "app"; program = "${office2024}/bin/${exe}"; };
     in
     {
       packages.${system} = {
         default = ms365;
-        inherit ms365 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
+        inherit ms365 office2024 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
       };
 
       apps.${system} = {
@@ -86,10 +105,16 @@
         powerpoint = mkApp "ms365-powerpoint";
         outlook = mkApp "ms365-outlook";
         onenote = mkApp "ms365-onenote";
+
+        office2024 = mkApp2024 "office2024";
+        word2024 = mkApp2024 "office2024-word";
+        excel2024 = mkApp2024 "office2024-excel";
+        powerpoint2024 = mkApp2024 "office2024-powerpoint";
+        onenote2024 = mkApp2024 "office2024-onenote";
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ ms365 pkgs.umu-launcher ];
+        packages = [ ms365 office2024 pkgs.umu-launcher ];
       };
     };
 }
