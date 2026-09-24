@@ -50,6 +50,13 @@ nix run .#word2024                            # also .#excel2024 .#powerpoint202
 `nix profile install .#office2024` gives `office2024`, `office2024-word`, ... and "Microsoft Word 2024
 (Proton)" style desktop entries. Every `MS365_*` knob below applies too.
 
+Desktop integration without `nix profile` (KDE Plasma, GNOME, SteamOS desktop mode, ...):
+`nix run .#shortcuts` adds menu entries and Desktop shortcuts with the apps' own icons (taken from
+the installed Office) and makes Word, Excel and PowerPoint the default apps for `.docx`, `.xlsx` and
+`.pptx`. `nix run .#shortcuts -- --help` lists the options (`--no-desktop`, `--no-defaults`,
+`--variant ms365`, `--uninstall`, which removes all of it and leaves Office installed). Run it again
+after a `git pull`.
+
 Activation: redeem the key at <https://setup.office.com> first, which attaches the licence to your
 Microsoft account. Do not type the key into Office ("I have a product key"): entering a key goes
 through the Windows Software Protection Platform, which Wine does not have (the `sppc/` shim refuses

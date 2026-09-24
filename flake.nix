@@ -115,13 +115,28 @@
         };
       });
 
+      # `nix run .#shortcuts`: menu entries, Desktop shortcuts, icons and file associations for an
+      # installed Office (see shortcuts.sh).
+      shortcuts = pkgs.writeShellApplication {
+        name = "office-shortcuts";
+        runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.findutils ];
+        text = ''
+          SHORTCUTS_OFFICE2024=${office2024}
+          SHORTCUTS_MS365=${ms365}
+          SHORTCUTS_ICOUTILS=${pkgs.icoutils}
+          SHORTCUTS_PYTHON=${pkgs.python3}
+          SHORTCUTS_XDG_UTILS=${pkgs.xdg-utils}
+          ${builtins.readFile ./shortcuts.sh}
+        '';
+      };
+
       mkApp = exe: { type = "app"; program = "${ms365}/bin/${exe}"; };
       mkApp2024 = exe: { type = "app"; program = "${office2024}/bin/${exe}"; };
     in
     {
       packages.${system} = {
         default = ms365;
-        inherit ms365 office2024 protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
+        inherit ms365 office2024 shortcuts protosoda protonGE sppcShim ole32ShimGE ole32ShimSoda uiaShim d2d1Fix;
       };
 
       apps.${system} = {
@@ -138,6 +153,8 @@
         excel2024 = mkApp2024 "office2024-excel";
         powerpoint2024 = mkApp2024 "office2024-powerpoint";
         onenote2024 = mkApp2024 "office2024-onenote";
+
+        shortcuts = { type = "app"; program = "${shortcuts}/bin/office-shortcuts"; };
       };
 
       devShells.${system}.default = pkgs.mkShell {
