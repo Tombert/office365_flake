@@ -25,11 +25,18 @@
           # they were created or last moved, not in Win32 z-order (see wayland-fix/). Swap in the
           # patched winewayland.so. Wine finds its unix libraries next to the resolved ntdll.so, so
           # those (and the loaders in files/bin) are real copies; everything else stays a symlink.
+          # The template prefix is copied as it is (real registry files, relative builtin-DLL
+          # links): Proton copies it into every new prefix symlinks-as-symlinks, and store symlinks
+          # there make system.reg and .update-timestamp read-only ("Read-only file system").
           src = pkgs.runCommand "${final.version}-x86_64-ms365" { } ''
             cp -rs ${release}/. $out
             chmod -R u+w $out
             for f in $out/files/lib/wine/x86_64-unix/* $out/files/bin/*; do
               [ -L "$f" ] && cp --remove-destination "$(readlink -f "$f")" "$f"
+            done
+            for d in $out/files/share/default_pfx*; do
+              rm -rf "$d"
+              cp -a ${release}/files/share/"$(basename "$d")" "$d"
             done
             install -m755 ${./wayland-fix/winewayland.so} $out/files/lib/wine/x86_64-unix/winewayland.so
           '';
