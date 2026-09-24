@@ -21,6 +21,7 @@
 #include <msi.h>
 typedef LPVOID HINTERNET;
 #include <winternl.h>
+#include <stddef.h>
 #include <string.h>
 
 /* ---- replacements ------------------------------------------------------------------------ */
@@ -902,9 +903,69 @@ static LRESULT CALLBACK border_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     else if (msg == WM_NCDESTROY) RemovePropW(hwnd, BORDER_PROC_PROP);
     return r;
 }
+/* ---- combase: COM calls that reach a thread after CoUninitialize ------------------------------
+ * Office's UI threads hand their accessibility objects (IAccessible, IAccessible2) to other threads,
+ * which call back into them through the thread's COM message window (OleMainThreadWndClass). When
+ * such a thread uninitializes COM while a call is still queued, Wine has already cleared the thread's
+ * apartment but keeps the window (the pending call holds a reference to the apartment), and
+ * rpc_execute_call dereferences the missing apartment: Excel died in combase at start-up under X11,
+ * where Proton's Xalia makes such calls from another process. Windows fails such calls
+ * with RPC_E_DISCONNECTED. The shim subclasses each apartment window when combase creates it (its
+ * CreateWindowExW import is patched) and completes calls that arrive on a thread without a
+ * single-threaded apartment that way. */
+#define DM_EXECUTERPC (WM_USER + 0)   /* combase_private.h */
+#define DM_HOSTOBJECT (WM_USER + 1)
+struct wine_dispatch_params {       /* combase/rpc.c, struct dispatch_params */
+    void *msg, *stub, *chan;
+    GUID iid;
+    void *iface;
+    HANDLE handle;                  /* signalled when the call is done */
+    BOOL bypass_rpcrt;
+    LONG status;
+    HRESULT hr;
+};
+_Static_assert(offsetof(struct wine_dispatch_params, handle) == 0x30 &&
+               offsetof(struct wine_dispatch_params, hr) == 0x40, "dispatch_params layout");
+typedef HRESULT (WINAPI *pCoGetApartmentType)(APTTYPE *, APTTYPEQUALIFIER *);
+static WNDPROC real_apartment_wndproc;
+static pCoGetApartmentType p_CoGetApartmentType;
+static LONG g_apt_logs;
+static LRESULT CALLBACK apartment_wndproc_guard(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == DM_EXECUTERPC || msg == DM_HOSTOBJECT) && lp && p_CoGetApartmentType) {
+        APTTYPE type; APTTYPEQUALIFIER qual;
+        HRESULT hr = p_CoGetApartmentType(&type, &qual);
+        if (FAILED(hr) || (type != APTTYPE_STA && type != APTTYPE_MAINSTA)) {
+            if (InterlockedIncrement(&g_apt_logs) <= 20)
+                OutputDebugStringA("ms365 ole32 shim: COM call to a thread without its apartment rejected (RPC_E_DISCONNECTED)");
+            if (msg == DM_HOSTOBJECT) return CO_E_NOTINITIALIZED;
+            struct wine_dispatch_params *p = (struct wine_dispatch_params *)lp;
+            p->hr = RPC_E_DISCONNECTED;
+            if (p->handle) SetEvent(p->handle);
+            return 0;
+        }
+    }
+    return CallWindowProcW(real_apartment_wndproc, hwnd, msg, wp, lp);
+}
+static void guard_apartment_window(HWND hwnd)
+{
+    WCHAR cn[32];
+    if (!GetClassNameW(hwnd, cn, 32) || lstrcmpW(cn, L"OleMainThreadWndClass") != 0) return;
+    WNDPROC orig = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (!orig || orig == apartment_wndproc_guard) return;
+    if (!p_CoGetApartmentType) {
+        HMODULE combase = GetModuleHandleW(L"combase.dll");
+        p_CoGetApartmentType = combase ? (pCoGetApartmentType)GetProcAddress(combase, "CoGetApartmentType") : NULL;
+    }
+    /* every apartment window shares combase's apartment_wndproc */
+    InterlockedCompareExchangePointer((void **)&real_apartment_wndproc, (void *)orig, NULL);
+    if (orig == real_apartment_wndproc) SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)apartment_wndproc_guard);
+}
+
 static HWND WINAPI my_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
 {
     HWND hwnd = real_CreateWindowExW(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
+    if (hwnd && parent == HWND_MESSAGE) guard_apartment_window(hwnd);
     if (hwnd && !parent && (style & WS_POPUP) && (ex & WS_EX_LAYERED) && own_borders()) {
         WCHAR cn[64];
         if (GetClassNameW(hwnd, cn, 64) && lstrcmpiW(cn, L"MSO_BORDEREFFECT_WINDOW_CLASS") == 0) {

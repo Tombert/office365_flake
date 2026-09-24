@@ -52,6 +52,11 @@ umu_env() {
   else
     export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
   fi
+  # Under X11 Proton starts Xalia, its gamepad helper for game launchers, next to every app. It walks
+  # the focused app's accessibility tree from another process, which does nothing for Office but
+  # floods its UI threads with cross-process COM calls; under Xwayland Excel crashed at start-up. (The
+  # Wayland driver never starts it.) Set PROTON_USE_XALIA=1 to have it anyway.
+  export PROTON_USE_XALIA="${PROTON_USE_XALIA:-0}"
   # GPU drivers on hosts other than NixOS (SteamOS, Arch, Fedora, ...): nixpkgs' umu runs Proton in a
   # NixOS-style sandbox whose own /usr has the GL/Vulkan loaders but no drivers; it finds drivers only
   # through /run/opengl-driver (share/ on XDG_DATA_DIRS for Vulkan, lib/ in its ld cache for EGL).
