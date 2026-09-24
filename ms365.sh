@@ -52,6 +52,20 @@ umu_env() {
   else
     export PROTON_USE_X11_EXCLUSIVE="${PROTON_USE_X11_EXCLUSIVE:-1}"
   fi
+  # GPU drivers on hosts other than NixOS (SteamOS, Arch, Fedora, ...): nixpkgs' umu runs Proton in a
+  # NixOS-style sandbox whose own /usr has the GL/Vulkan loaders but no drivers; it finds drivers only
+  # through /run/opengl-driver (share/ on XDG_DATA_DIRS for Vulkan, lib/ in its ld cache for EGL).
+  # Without them there is no Vulkan (Office's Direct3D, DXVK) and Word exits at once ("radeonsi:
+  # driver missing"). Hand pressure-vessel the Mesa from the flake's nixpkgs instead: its Vulkan ICD
+  # and EGL vendor files name their libraries by store path.
+  # MS365_HOST_DRIVERS=1 skips this (e.g. when /run/opengl-driver is provided some other way).
+  if [ "${MS365_HOST_DRIVERS:-0}" != 1 ] && ! ls /run/opengl-driver/share/vulkan/icd.d/*.json >/dev/null 2>&1; then
+    case ":${XDG_DATA_DIRS:-}:" in
+      *":$MS365_MESA/share:"*) ;;
+      *) export XDG_DATA_DIRS="$MS365_MESA/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" ;;
+    esac
+    export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-$MS365_MESA/share/glvnd/egl_vendor.d/50_mesa.json}"
+  fi
   # MS365_RADV_DEBUG sets RADV_DEBUG for the AMD driver (default: none).
   if [ -z "${RADV_DEBUG:-}" ] && [ -n "${MS365_RADV_DEBUG:-}" ]; then
     export RADV_DEBUG="$MS365_RADV_DEBUG"
@@ -734,6 +748,7 @@ Environment (all optional):
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
   MS365_RADV_DEBUG=<flags>  AMD driver debug flags to export as RADV_DEBUG (default: none)
+  MS365_HOST_DRIVERS=1  don't hand Proton the flake's Mesa when /run/opengl-driver is missing (non-NixOS hosts)
   MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
   MS365_WAYLAND=0  use X11/Xwayland instead of Wine's Wayland driver (default 1 in a Wayland session)
   MS365_DPI=<n>    Wine dpi (default: 96 * the focused sway output's scale, capped at 180, on the Wayland driver; 96 on X11)

@@ -4,6 +4,7 @@
 , symlinkJoin
 , makeDesktopItem
 , umu-launcher
+, mesa
 , curl
 , coreutils
 , gnused
@@ -55,7 +56,8 @@ let
       MS365_D2D1_DLL=${d2d1Fix}/lib/wine/x86_64-windows/d2d1.dll
       MS365_MSI_COMPONENTS=${./msi-components.py}
       MS365_UI_FONTS=${selawik}
-      export MS365_UI_FONTS MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_MSI_COMPONENTS
+      MS365_MESA=${mesa}
+      export MS365_UI_FONTS MS365_MESA MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_MSI_COMPONENTS
       ${builtins.readFile ./ms365.sh}
     '';
   };
