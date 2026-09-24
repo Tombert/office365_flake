@@ -1270,6 +1270,227 @@ static void patch_axis_aligned_clip(void *ctx)
     svg_log("ms365 ole32 shim: ID2D1RenderTarget::PushAxisAlignedClip DPI fix installed");
 }
 
+/* ---- Direct2D command lists (Excel's histogram, waterfall, box & whisker, ... charts) --------
+ * Office records these charts into an ID2D1CommandList, on worker threads too, and later draws the
+ * list with ID2D1DeviceContext::DrawImage. Wine's d2d1 (11.16 and master) records the commands, but
+ * EndDraw on a command-list target returns E_NOTIMPL ("Unimplemented for command list target") and
+ * DrawImage only draws bitmaps. Office takes every such render as failed: the chart stays blank,
+ * the chart-style gallery keeps spinning, and the workbook cannot be saved with the chart in it.
+ * EndDraw reports success for command-list targets as Windows does, and DrawImage of a command list
+ * replays it onto the target through ID2D1CommandList::Stream with a sink that forwards each
+ * recorded command to the target context (the recording's transforms composed with the draw
+ * offset and the target's transform). MS365_NO_COMMAND_LISTS=1 turns both off. */
+#define D2D_RT_CREATESOLIDBRUSH  8
+#define D2D_RT_DRAWLINE          15
+#define D2D_RT_DRAWRECTANGLE     16
+#define D2D_RT_FILLRECTANGLE     17
+#define D2D_RT_DRAWGEOMETRY      22
+#define D2D_RT_FILLGEOMETRY      23
+#define D2D_RT_FILLMESH          24
+#define D2D_RT_SETAA             32
+#define D2D_RT_GETAA             33
+#define D2D_RT_SETTEXTAA         34
+#define D2D_RT_GETTEXTAA         35
+#define D2D_RT_SETTEXTPARAMS     36
+#define D2D_RT_GETTEXTPARAMS     37
+#define D2D_RT_SETTAGS           38
+#define D2D_RT_POPLAYER          41
+#define D2D_RT_POPAXISALIGNEDCLIP 46
+#define D2D_RT_ENDDRAW           49
+#define D2D_CTX_SETPRIMITIVEBLEND 78
+#define D2D_CTX_GETPRIMITIVEBLEND 79
+#define D2D_CTX_DRAWGLYPHRUN     82
+#define D2D_CTX_DRAWIMAGE        83
+#define D2D_CTX_DRAWGDIMETAFILE  84
+#define D2D_CTX_DRAWBITMAP       85
+#define D2D_CTX_PUSHLAYER        86
+#define D2D_CTX_FILLOPACITYMASK  91
+#define D2D_CMDLIST_STREAM       4    /* ID2D1CommandList: IUnknown, GetFactory, Stream, Close */
+static const GUID MY_IID_ID2D1CommandSink = { 0x54d7898a, 0xa061, 0x40a7, { 0xbe, 0xc7, 0xe4, 0x65, 0xbc, 0xba, 0x2c, 0x4f } };
+typedef struct { float x, y; } my_pt;
+typedef struct { float left, top, right, bottom; } my_rect;
+typedef HRESULT (WINAPI *pEndDraw)(void *, UINT64 *, UINT64 *);
+typedef void (WINAPI *pDrawImage)(void *, void *, const my_pt *, const my_rect *, int, int);
+static pEndDraw real_EndDraw;
+static pDrawImage real_DrawImage;
+
+static my_mat3x2 mat_mul(const my_mat3x2 *a, const my_mat3x2 *b)
+{
+    my_mat3x2 r;
+    r._11 = a->_11 * b->_11 + a->_12 * b->_21;  r._12 = a->_11 * b->_12 + a->_12 * b->_22;
+    r._21 = a->_21 * b->_11 + a->_22 * b->_21;  r._22 = a->_21 * b->_12 + a->_22 * b->_22;
+    r._31 = a->_31 * b->_11 + a->_32 * b->_21 + b->_31;
+    r._32 = a->_31 * b->_12 + a->_32 * b->_22 + b->_32;
+    return r;
+}
+
+/* ID2D1CommandSink forwarding to a device context. Lives on the stack for one DrawImage. */
+struct cl_sink {
+    const void *const *vtbl;
+    void *ctx;
+    my_mat3x2 base;             /* recording space -> the target's space */
+    int depth; char pushed[64]; /* clips ('c') and layers ('l') the recording has not popped yet */
+};
+#define SINK_CTX(s) (((struct cl_sink *)(s))->ctx)
+static HRESULT WINAPI sink_QI(void *s, REFIID riid, void **out)
+{
+    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &MY_IID_ID2D1CommandSink)) { *out = s; return S_OK; }
+    *out = NULL; return E_NOINTERFACE;
+}
+static ULONG WINAPI sink_AddRef(void *s) { (void)s; return 1; }
+static ULONG WINAPI sink_Release(void *s) { (void)s; return 1; }
+static HRESULT WINAPI sink_BeginDraw(void *s) { (void)s; return S_OK; }
+static HRESULT WINAPI sink_EndDraw(void *s) { (void)s; return S_OK; }
+static HRESULT WINAPI sink_SetAntialiasMode(void *s, int m)
+{ COM_CALL(SINK_CTX(s), D2D_RT_SETAA, void (WINAPI *)(void *, int))(SINK_CTX(s), m); return S_OK; }
+static HRESULT WINAPI sink_SetTags(void *s, UINT64 t1, UINT64 t2)
+{ COM_CALL(SINK_CTX(s), D2D_RT_SETTAGS, void (WINAPI *)(void *, UINT64, UINT64))(SINK_CTX(s), t1, t2); return S_OK; }
+static HRESULT WINAPI sink_SetTextAntialiasMode(void *s, int m)
+{ COM_CALL(SINK_CTX(s), D2D_RT_SETTEXTAA, void (WINAPI *)(void *, int))(SINK_CTX(s), m); return S_OK; }
+static HRESULT WINAPI sink_SetTextRenderingParams(void *s, void *p)
+{ COM_CALL(SINK_CTX(s), D2D_RT_SETTEXTPARAMS, void (WINAPI *)(void *, void *))(SINK_CTX(s), p); return S_OK; }
+static HRESULT WINAPI sink_SetTransform(void *s, const my_mat3x2 *m)
+{
+    struct cl_sink *k = s; my_mat3x2 t = mat_mul(m, &k->base);
+    real_RtSetTransform(k->ctx, &t); return S_OK;
+}
+static HRESULT WINAPI sink_SetPrimitiveBlend(void *s, int b)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_SETPRIMITIVEBLEND, void (WINAPI *)(void *, int))(SINK_CTX(s), b); return S_OK; }
+static HRESULT WINAPI sink_SetUnitMode(void *s, int m)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_SETUNITMODE, void (WINAPI *)(void *, int))(SINK_CTX(s), m); return S_OK; }
+static HRESULT WINAPI sink_Clear(void *s, const float *color)
+{
+    /* Clear inside a recording covers the recording's area; approximate with a fill (the replay
+     * is clipped to the image rectangle when one is given). Transparent clears draw nothing. */
+    void *brush = NULL; my_rect all = { -1e7f, -1e7f, 1e7f, 1e7f };
+    if (!color || color[3] == 0.0f) return S_OK;
+    if (SUCCEEDED(COM_CALL(SINK_CTX(s), D2D_RT_CREATESOLIDBRUSH, HRESULT (WINAPI *)(void *, const float *, const void *, void **))(SINK_CTX(s), color, NULL, &brush)) && brush) {
+        COM_CALL(SINK_CTX(s), D2D_RT_FILLRECTANGLE, void (WINAPI *)(void *, const my_rect *, void *))(SINK_CTX(s), &all, brush);
+        COM_CALL(brush, 2, pUnkRelease)(brush);
+    }
+    return S_OK;
+}
+static HRESULT WINAPI sink_DrawGlyphRun(void *s, my_pt origin, const void *run, const void *desc, void *brush, int mode)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_DRAWGLYPHRUN, void (WINAPI *)(void *, my_pt, const void *, const void *, void *, int))(SINK_CTX(s), origin, run, desc, brush, mode); return S_OK; }
+static HRESULT WINAPI sink_DrawLine(void *s, my_pt p0, my_pt p1, void *brush, float w, void *style)
+{ COM_CALL(SINK_CTX(s), D2D_RT_DRAWLINE, void (WINAPI *)(void *, my_pt, my_pt, void *, float, void *))(SINK_CTX(s), p0, p1, brush, w, style); return S_OK; }
+static HRESULT WINAPI sink_DrawGeometry(void *s, void *geom, void *brush, float w, void *style)
+{ COM_CALL(SINK_CTX(s), D2D_RT_DRAWGEOMETRY, void (WINAPI *)(void *, void *, void *, float, void *))(SINK_CTX(s), geom, brush, w, style); return S_OK; }
+static HRESULT WINAPI sink_DrawRectangle(void *s, const my_rect *r, void *brush, float w, void *style)
+{ COM_CALL(SINK_CTX(s), D2D_RT_DRAWRECTANGLE, void (WINAPI *)(void *, const my_rect *, void *, float, void *))(SINK_CTX(s), r, brush, w, style); return S_OK; }
+static HRESULT WINAPI sink_DrawBitmap(void *s, void *bmp, const my_rect *dst, float opacity, int interp, const my_rect *src, const void *persp)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_DRAWBITMAP, void (WINAPI *)(void *, void *, const my_rect *, float, int, const my_rect *, const void *))(SINK_CTX(s), bmp, dst, opacity, interp, src, persp); return S_OK; }
+static HRESULT WINAPI sink_DrawImage(void *s, void *img, const my_pt *off, const my_rect *rect, int interp, int comp)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_DRAWIMAGE, pDrawImage)(SINK_CTX(s), img, off, rect, interp, comp); return S_OK; }
+static HRESULT WINAPI sink_DrawGdiMetafile(void *s, void *meta, const my_pt *off)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_DRAWGDIMETAFILE, void (WINAPI *)(void *, void *, const my_pt *))(SINK_CTX(s), meta, off); return S_OK; }
+static HRESULT WINAPI sink_FillMesh(void *s, void *mesh, void *brush)
+{ COM_CALL(SINK_CTX(s), D2D_RT_FILLMESH, void (WINAPI *)(void *, void *, void *))(SINK_CTX(s), mesh, brush); return S_OK; }
+static HRESULT WINAPI sink_FillOpacityMask(void *s, void *bmp, void *brush, const my_rect *dst, const my_rect *src)
+{ COM_CALL(SINK_CTX(s), D2D_CTX_FILLOPACITYMASK, void (WINAPI *)(void *, void *, void *, const my_rect *, const my_rect *))(SINK_CTX(s), bmp, brush, dst, src); return S_OK; }
+static HRESULT WINAPI sink_FillGeometry(void *s, void *geom, void *brush, void *opacity)
+{ COM_CALL(SINK_CTX(s), D2D_RT_FILLGEOMETRY, void (WINAPI *)(void *, void *, void *, void *))(SINK_CTX(s), geom, brush, opacity); return S_OK; }
+static HRESULT WINAPI sink_FillRectangle(void *s, const my_rect *r, void *brush)
+{ COM_CALL(SINK_CTX(s), D2D_RT_FILLRECTANGLE, void (WINAPI *)(void *, const my_rect *, void *))(SINK_CTX(s), r, brush); return S_OK; }
+static HRESULT WINAPI sink_PushAxisAlignedClip(void *s, const my_rect *r, int aa)
+{
+    struct cl_sink *k = s;
+    if (k->depth >= (int)sizeof(k->pushed)) return S_OK;
+    COM_CALL(k->ctx, D2D_RT_PUSHAXISALIGNEDCLIP, pPushAxisAlignedClip)(k->ctx, r, aa);
+    k->pushed[k->depth++] = 'c'; return S_OK;
+}
+static HRESULT WINAPI sink_PushLayer(void *s, const void *params, void *layer)
+{
+    struct cl_sink *k = s;
+    if (k->depth >= (int)sizeof(k->pushed)) return S_OK;
+    COM_CALL(k->ctx, D2D_CTX_PUSHLAYER, void (WINAPI *)(void *, const void *, void *))(k->ctx, params, layer);
+    k->pushed[k->depth++] = 'l'; return S_OK;
+}
+static void sink_pop(struct cl_sink *k)
+{
+    if (k->depth <= 0) return;
+    if (k->pushed[--k->depth] == 'c') COM_CALL(k->ctx, D2D_RT_POPAXISALIGNEDCLIP, void (WINAPI *)(void *))(k->ctx);
+    else COM_CALL(k->ctx, D2D_RT_POPLAYER, void (WINAPI *)(void *))(k->ctx);
+}
+static HRESULT WINAPI sink_PopAxisAlignedClip(void *s) { sink_pop(s); return S_OK; }
+static HRESULT WINAPI sink_PopLayer(void *s) { sink_pop(s); return S_OK; }
+static const void *const cl_sink_vtbl[] = {
+    sink_QI, sink_AddRef, sink_Release, sink_BeginDraw, sink_EndDraw, sink_SetAntialiasMode, sink_SetTags,
+    sink_SetTextAntialiasMode, sink_SetTextRenderingParams, sink_SetTransform, sink_SetPrimitiveBlend,
+    sink_SetUnitMode, sink_Clear, sink_DrawGlyphRun, sink_DrawLine, sink_DrawGeometry, sink_DrawRectangle,
+    sink_DrawBitmap, sink_DrawImage, sink_DrawGdiMetafile, sink_FillMesh, sink_FillOpacityMask,
+    sink_FillGeometry, sink_FillRectangle, sink_PushAxisAlignedClip, sink_PushLayer,
+    sink_PopAxisAlignedClip, sink_PopLayer,
+};
+
+static HRESULT WINAPI my_EndDraw(void *ctx, UINT64 *tag1, UINT64 *tag2)
+{
+    HRESULT hr = real_EndDraw(ctx, tag1, tag2);
+    if (hr == E_NOTIMPL) {   /* only for a command-list target: the commands are recorded */
+        if (tag1) *tag1 = 0;
+        if (tag2) *tag2 = 0;
+        hr = S_OK;
+    }
+    return hr;
+}
+static void WINAPI my_DrawImage(void *ctx, void *image, const my_pt *offset, const my_rect *image_rect, int interp, int composite)
+{
+    void *list = NULL, *params = NULL; my_mat3x2 old, shift = { 1, 0, 0, 1, 0, 0 };
+    int aa, text_aa, blend, unit; HRESULT hr;
+    struct cl_sink sink;
+
+    if (!image || FAILED(COM_CALL(image, 0, pUnkQI)(image, &MY_IID_ID2D1CommandList, &list)) || !list) {
+        real_DrawImage(ctx, image, offset, image_rect, interp, composite);
+        return;
+    }
+    if (target_is_command_list(ctx)) {   /* recording into another list: Wine records the call */
+        COM_CALL(list, 2, pUnkRelease)(list);
+        real_DrawImage(ctx, image, offset, image_rect, interp, composite);
+        return;
+    }
+    /* the image rectangle's top-left lands at the offset */
+    shift._31 = (offset ? offset->x : 0.0f) - (image_rect ? image_rect->left : 0.0f);
+    shift._32 = (offset ? offset->y : 0.0f) - (image_rect ? image_rect->top : 0.0f);
+    real_RtGetTransform(ctx, &old);
+    aa = ((int (WINAPI *)(void *))(*(void ***)ctx)[D2D_RT_GETAA])(ctx);
+    text_aa = ((int (WINAPI *)(void *))(*(void ***)ctx)[D2D_RT_GETTEXTAA])(ctx);
+    blend = ((int (WINAPI *)(void *))(*(void ***)ctx)[D2D_CTX_GETPRIMITIVEBLEND])(ctx);
+    unit = ((int (WINAPI *)(void *))(*(void ***)ctx)[D2D_CTX_GETUNITMODE])(ctx);
+    COM_CALL(ctx, D2D_RT_GETTEXTPARAMS, void (WINAPI *)(void *, void **))(ctx, &params);
+
+    sink.vtbl = cl_sink_vtbl; sink.ctx = ctx; sink.depth = 0;
+    sink.base = mat_mul(&shift, &old);
+    real_RtSetTransform(ctx, &sink.base);
+    if (image_rect) sink_PushAxisAlignedClip(&sink, image_rect, 0 /* per-primitive */);
+    hr = COM_CALL(list, D2D_CMDLIST_STREAM, HRESULT (WINAPI *)(void *, void *))(list, &sink);
+    while (sink.depth > 0) sink_pop(&sink);
+
+    real_RtSetTransform(ctx, &old);
+    COM_CALL(ctx, D2D_RT_SETAA, void (WINAPI *)(void *, int))(ctx, aa);
+    COM_CALL(ctx, D2D_RT_SETTEXTAA, void (WINAPI *)(void *, int))(ctx, text_aa);
+    COM_CALL(ctx, D2D_CTX_SETPRIMITIVEBLEND, void (WINAPI *)(void *, int))(ctx, blend);
+    COM_CALL(ctx, D2D_CTX_SETUNITMODE, void (WINAPI *)(void *, int))(ctx, unit);
+    COM_CALL(ctx, D2D_RT_SETTEXTPARAMS, void (WINAPI *)(void *, void *))(ctx, params);
+    if (params) COM_CALL(params, 2, pUnkRelease)(params);
+    COM_CALL(list, 2, pUnkRelease)(list);
+    if (FAILED(hr)) svg_log("ms365 ole32 shim: command list replay: Stream failed");
+    if (composite != 0) svg_log("ms365 ole32 shim: command list replay: composite mode other than source-over drawn as source-over");
+    (void)interp;
+}
+static void patch_command_lists(void *ctx)
+{
+    void **vt = *(void ***)ctx; DWORD old; char v[4] = "";
+    if (GetEnvironmentVariableA("MS365_NO_COMMAND_LISTS", v, sizeof(v)) && v[0] == '1') return;
+    if (vt[D2D_CTX_DRAWIMAGE] == (void *)my_DrawImage) return;
+    if (!VirtualProtect(vt, (D2D_CTX_FILLOPACITYMASK + 1) * sizeof(void *), PAGE_READWRITE, &old)) return;
+    real_EndDraw = (pEndDraw)vt[D2D_RT_ENDDRAW];
+    real_DrawImage = (pDrawImage)vt[D2D_CTX_DRAWIMAGE];
+    vt[D2D_RT_ENDDRAW] = (void *)my_EndDraw;
+    vt[D2D_CTX_DRAWIMAGE] = (void *)my_DrawImage;
+    VirtualProtect(vt, (D2D_CTX_FILLOPACITYMASK + 1) * sizeof(void *), old, &old);
+    svg_log("ms365 ole32 shim: ID2D1CommandList EndDraw/DrawImage replay installed");
+}
+
 typedef HRESULT (WINAPI *pD2D1CreateFactory)(int, REFIID, const void *, void **);
 static pD2D1CreateFactory real_D2D1CreateFactory;
 static LONG g_svg_vtbl_state;
@@ -1294,6 +1515,7 @@ static void patch_svg_vtable(void *factory)
         }
         patch_axis_aligned_clip(ctx);   /* first: it keeps Wine's own GetDpi */
         patch_unit_mode(ctx);
+        patch_command_lists(ctx);
         COM_CALL(ctx, 2, pUnkRelease)(ctx);
     } else svg_log("ms365 ole32 shim: SVG patch: no ID2D1DeviceContext5");
     COM_CALL(rt, 2, pUnkRelease)(rt);
@@ -1370,6 +1592,48 @@ static HRESULT WINAPI my_LoadRegTypeLib(REFGUID guid, WORD maj, WORD min, LCID l
     return hr;
 }
 
+/* ---- xmllite: namespace declarations that name the xmlns namespace --------------------------
+ * Excel's newer chart types (histogram, Pareto, box and whisker, waterfall, treemap, sunburst,
+ * funnel: "Ivy" charts in chart.dll) declare the namespaces of the chart part as
+ * WriteAttributeString(L"xmlns", L"a", L"http://www.w3.org/2000/xmlns/", uri). Windows' xmllite
+ * takes the xmlns prefix with its own namespace URI; Wine's returns WR_E_XMLNSPREFIXDECLARATION for
+ * any URI there, chart.dll throws IvyPersistence::PersistenceError, and saving a workbook with such
+ * a chart fails ("Errors were detected while saving"). This wraps IXmlWriter::WriteAttributeString
+ * on Wine's shared writer vtable, patched when the first writer is created, and drops that URI;
+ * Wine then writes the same xmlns:a declaration. */
+static const GUID MY_IID_IXmlWriter = { 0x7279fc88, 0x709d, 0x4095, { 0xb6, 0x3d, 0x69, 0xfe, 0x4b, 0x0d, 0x90, 0x30 } };
+#define XMLWRITER_WRITEATTRIBUTESTRING 7
+typedef HRESULT (WINAPI *pCreateXmlWriter)(REFIID, void **, void *);
+typedef HRESULT (WINAPI *pWriteAttributeString)(void *, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR);
+static pCreateXmlWriter real_CreateXmlWriter;
+static pWriteAttributeString real_WriteAttributeString;
+static HRESULT WINAPI my_WriteAttributeString(void *w, LPCWSTR prefix, LPCWSTR local, LPCWSTR uri, LPCWSTR value)
+{
+    if (prefix && uri && !lstrcmpW(prefix, L"xmlns") && !lstrcmpW(uri, L"http://www.w3.org/2000/xmlns/")) uri = NULL;
+    return real_WriteAttributeString(w, prefix, local, uri, value);
+}
+static void patch_xmlwriter_vtable(void *unk)
+{
+    static LONG done; void *w = NULL, **vt; DWORD old;
+    if (done || FAILED(COM_CALL(unk, 0, pUnkQI)(unk, &MY_IID_IXmlWriter, &w)) || !w) return;
+    vt = *(void ***)w;
+    if (vt[XMLWRITER_WRITEATTRIBUTESTRING] != (void *)my_WriteAttributeString &&
+        VirtualProtect(&vt[XMLWRITER_WRITEATTRIBUTESTRING], sizeof(void *), PAGE_READWRITE, &old)) {
+        real_WriteAttributeString = (pWriteAttributeString)vt[XMLWRITER_WRITEATTRIBUTESTRING];
+        vt[XMLWRITER_WRITEATTRIBUTESTRING] = (void *)my_WriteAttributeString;
+        VirtualProtect(&vt[XMLWRITER_WRITEATTRIBUTESTRING], sizeof(void *), old, &old);
+        done = 1;
+        OutputDebugStringA("ms365 ole32 shim: IXmlWriter::WriteAttributeString wrapped (xmlns declarations)");
+    }
+    COM_CALL(w, 2, pUnkRelease)(w);
+}
+static HRESULT WINAPI my_CreateXmlWriter(REFIID iid, void **out, void *malloc)
+{
+    HRESULT hr = real_CreateXmlWriter ? real_CreateXmlWriter(iid, out, malloc) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out && *out) patch_xmlwriter_vtable(*out);
+    return hr;
+}
+
 static const struct patch PATCHES[] = {
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
@@ -1396,6 +1660,7 @@ static const struct patch PATCHES[] = {
     { "oleaut32.dll", "LoadTypeLibEx",               (void *)my_LoadTypeLibEx },
     { "oleaut32.dll", "LoadTypeLib",                 (void *)my_LoadTypeLib },
     { "oleaut32.dll", "LoadRegTypeLib",              (void *)my_LoadRegTypeLib },
+    { "xmllite.dll",  "CreateXmlWriter",             (void *)my_CreateXmlWriter },
 };
 #define NPATCHES (sizeof(PATCHES) / sizeof(PATCHES[0]))
 
@@ -1414,6 +1679,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "crypt32.dll", NULL },
     { "virtdisk.dll", NULL },
     { "oleaut32.dll", NULL },
+    { "xmllite.dll", NULL },
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -1491,6 +1757,8 @@ static void note_module(HMODULE h, const char *modname)
             real_LoadTypeLibEx = (pLoadTypeLibEx)real_GetProcAddress(h, "LoadTypeLibEx");
             real_LoadTypeLib = (pLoadTypeLib)real_GetProcAddress(h, "LoadTypeLib");
             real_LoadRegTypeLib = (pLoadRegTypeLib)real_GetProcAddress(h, "LoadRegTypeLib");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "xmllite.dll") == 0) {
+            real_CreateXmlWriter = (pCreateXmlWriter)real_GetProcAddress(h, "CreateXmlWriter");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "msi.dll") == 0) {
             real_MsiQueryFeatureStateW = (pMsiQueryFeatureStateW)real_GetProcAddress(h, "MsiQueryFeatureStateW");
             real_MsiGetComponentPathExW = (pMsiGetComponentPathExW)real_GetProcAddress(h, "MsiGetComponentPathExW");
