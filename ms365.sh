@@ -72,7 +72,7 @@ ensure_prefix() {
   # copied those links into new prefixes: creation stopped at "Read-only file system:
   # .../pfx/.update-timestamp" and Proton never replaces files that already exist.
   if [ -L "$MS365_PREFIX/pfx/system.reg" ]; then
-    die "$MS365_PREFIX was left half-created by an earlier version of this flake (its registry files point into the read-only Nix store). Nothing is installed in it yet; delete it and run again: rm -rf '$MS365_PREFIX'"
+    die "$MS365_PREFIX was left half-created by an earlier version of this flake (its registry files point into the read-only Nix store). Nothing is installed in it yet; delete it (downloads are kept) and install again: $MS365_CLI reset --yes && $MS365_CLI install"
   fi
   if [ ! -f "$MS365_PREFIX/pfx/system.reg" ] && [ ! -f "$MS365_PREFIX/system.reg" ]; then
     log "Creating Proton prefix at $MS365_PREFIX with $(runner_path)"
