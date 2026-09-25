@@ -1,6 +1,26 @@
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -543,6 +543,9 @@
+     struct wl_surface *dmabuf_bottom;
+     BOOL carrier_attached;
+     BOOL carrier_opaque;
++    /* client subsurfaces below this surface, top to bottom, as last stacked */
++    struct wayland_client_surface *client_order[128];
++    UINT client_order_count;
+     BOOL carrier_single_pixel;
+     int carrier_width, carrier_height;
+     HRGN child_region;
+@@ -715,6 +718,7 @@
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ void wayland_client_surfaces_attach(struct wayland_win_data *data, HWND toplevel);
++void wayland_surface_restack_clients_if_changed(struct wayland_surface *surface);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
+                                  HRGN damage_region, BOOL content_over_producer);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -2606,6 +2606,55 @@
+@@ -2606,6 +2606,72 @@
      return TRUE;
  }
  
@@ -36,31 +56,60 @@
 +
 +/* Subsurfaces are stacked below the parent surface one by one as they are created or moved, so the
 + * last one configured ends up on top whatever the Win32 z-order says (OneNote's full-size navigation
-+ * background covered its notebook and page lists). Restack all of them in Win32 order. */
-+static void wayland_surface_restack_clients(struct wayland_surface *surface,
-+                                            struct wayland_client_surface *current)
++ * background covered its notebook and page lists). Restack all of them in Win32 order. With 'force'
++ * unset, nothing is done if the order is the one stacked last time. Returns whether it restacked. */
++static BOOL wayland_surface_restack_clients(struct wayland_surface *surface,
++                                            struct wayland_client_surface *current, BOOL force)
 +{
-+    struct wayland_client_surface *clients[128];
++    struct wayland_client_surface *clients[ARRAY_SIZE(surface->client_order)];
 +    struct wl_surface *above = wayland_surface_client_stack_anchor(surface);
 +    UINT count = 0, i;
 +
 +    wayland_surface_collect_clients(surface, surface->hwnd, current, clients, &count, ARRAY_SIZE(clients), 0);
++    if (!force && count == surface->client_order_count &&
++        !memcmp(clients, surface->client_order, count * sizeof(*clients)))
++        return FALSE;
++
 +    for (i = 0; i < count; i++)
 +    {
 +        wl_subsurface_place_below(clients[i]->wl_subsurface, above);
 +        above = clients[i]->wl_surface;
 +    }
++    memcpy(surface->client_order, clients, count * sizeof(*clients));
++    surface->client_order_count = count;
 +    TRACE("hwnd=%p restacked %u client surfaces\n", surface->hwnd, count);
++    return TRUE;
++}
++
++/* A child window's z-order can change without any of its client surfaces moving or being
++ * reconfigured: Excel shows its in-cell editor at the bottom of its siblings and raises it to the
++ * top a moment later. Called with win_data_mutex held. */
++void wayland_surface_restack_clients_if_changed(struct wayland_surface *surface)
++{
++    if (wayland_surface_restack_clients(surface, NULL, FALSE))
++        wl_surface_commit(surface->wl_surface);
 +}
 +
  static void wayland_client_surface_stack(struct wayland_surface *surface,
                                           struct wayland_client_surface *client,
                                           BOOL stack_above_parent)
-@@ -2622,6 +2671,7 @@
+@@ -2622,6 +2688,7 @@
          wl_subsurface_place_below(client->wl_subsurface,
                                    wayland_surface_client_stack_anchor(surface));
      client->stack_above_parent = stack_above_parent;
-+    if (!effective_stack_above_parent) wayland_surface_restack_clients(surface, client);
++    if (!effective_stack_above_parent) wayland_surface_restack_clients(surface, client, TRUE);
  }
  
  static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1042,6 +1042,9 @@
+             wayland_surface_destroy(data->wayland_surface);
+             data->wayland_surface = NULL;
+         }
++        /* client surfaces are stacked in Win32 order, which this may have changed */
++        if (toplevel_surface && !(swp_flags & SWP_NOZORDER))
++            wayland_surface_restack_clients_if_changed(toplevel_surface);
+     }
+     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
+                                                      use_layer_shell, tray_menu, surface, swp_flags,

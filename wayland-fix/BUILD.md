@@ -3,7 +3,8 @@
 `winewayland.so` is GE-Proton11-7's Wayland driver with three changes:
 
 * `client-surface-zorder.patch`: stacks the subsurfaces of self-presenting child windows in Win32
-  z-order (OneNote's lists, Excel's grid).
+  z-order (OneNote's lists, Excel's grid), and again whenever a child window's z-order changes
+  (Excel's in-cell editor is raised above the grid only after it is shown).
 * `virtual-modifiers.patch`: Shift, Ctrl and Alt that exist only in the compositor's modifier state.
 * the cursor-shape edit in `build.sh`: `all_resize` sent as `move`.
 
