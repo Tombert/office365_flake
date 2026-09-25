@@ -1,0 +1,129 @@
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -838,6 +838,23 @@
+     return FALSE;
+ }
+ 
++/* Keyboards that exist only in software, such as Steam's on-screen keyboard, type characters like
++ * '(' by putting Shift into the compositor's modifier state without sending a Shift key event.
++ * Wayland clients that translate keys with xkbcommon see ')', but Windows applications go by the
++ * key state, which only key events change, and get '0'. The modifiers below are pressed with their
++ * left key before such a key press and released when the compositor clears them. */
++static const struct
++{
++    const char *name;
++    uint32_t left, right;
++} virtual_mods[] =
++{
++    {XKB_MOD_NAME_SHIFT, KEY_LEFTSHIFT, KEY_RIGHTSHIFT},
++    {XKB_MOD_NAME_CTRL,  KEY_LEFTCTRL,  KEY_RIGHTCTRL},
++    {XKB_MOD_NAME_ALT,   KEY_LEFTALT,   KEY_RIGHTALT},
++};
++static BOOL virtual_mod_down[ARRAY_SIZE(virtual_mods)];
++
+ static void release_all_keys(HWND hwnd)
+ {
+     INPUT input = {0};
+@@ -859,6 +876,7 @@
+         NtUserSendHardwareInput(hwnd, 0, &input, 0);
+         keyboard->keystate[i] = 0;
+     }
++    memset(virtual_mod_down, 0, sizeof(virtual_mod_down));
+ }
+ 
+ /**********************************************************************
+@@ -1132,6 +1150,65 @@
+     if (changed) set_async_key_state(state);
+ }
+ 
++static void send_virtual_mod(HWND hwnd, unsigned int i, BOOL down)
++{
++    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    UINT scan = key2scan(virtual_mods[i].left);
++    INPUT input = {0};
++
++    TRACE_(key)("%s %s for the compositor's modifier state\n", down ? "pressing" : "releasing",
++                virtual_mods[i].name);
++
++    input.type = INPUT_KEYBOARD;
++    input.ki.wScan = scan;
++    input.ki.dwFlags = KEYEVENTF_SCANCODE;
++    if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
++    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    /* recorded as held, so release_all_keys() releases it on focus loss */
++    keyboard->keystate[scan] = down;
++    virtual_mod_down[i] = down;
++}
++
++/* key_press: a key that is not a modifier is about to be pressed. Otherwise only releases. */
++static void sync_virtual_mods(HWND hwnd, BOOL key_press)
++{
++    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(virtual_mods); i++)
++    {
++        BOOL active = FALSE, held;
++
++        if (!key_press && !virtual_mod_down[i]) continue;
++
++        pthread_mutex_lock(&keyboard->mutex);
++        if (keyboard->xkb_state)
++            active = xkb_state_mod_name_is_active(keyboard->xkb_state, virtual_mods[i].name,
++                                                  XKB_STATE_MODS_DEPRESSED | XKB_STATE_MODS_LATCHED) > 0;
++        pthread_mutex_unlock(&keyboard->mutex);
++
++        held = keyboard->keystate[key2scan(virtual_mods[i].right)] ||
++               (keyboard->keystate[key2scan(virtual_mods[i].left)] && !virtual_mod_down[i]);
++
++        if (key_press && active && !held && !virtual_mod_down[i]) send_virtual_mod(hwnd, i, TRUE);
++        else if (virtual_mod_down[i] && !active) send_virtual_mod(hwnd, i, FALSE);
++    }
++}
++
++/* A real event for a modifier key takes over from a virtual press of that modifier. */
++static BOOL is_virtual_mod_key(HWND hwnd, uint32_t key)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(virtual_mods); i++)
++    {
++        if (key != virtual_mods[i].left && key != virtual_mods[i].right) continue;
++        if (virtual_mod_down[i]) send_virtual_mod(hwnd, i, FALSE);
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
+                                 uint32_t serial, uint32_t time, uint32_t key,
+                                 uint32_t state)
+@@ -1160,6 +1237,11 @@
+     if (key != KEY_CAPSLOCK && key != KEY_SCROLLLOCK && key != KEY_NUMLOCK)
+         update_mod_state(hwnd);
+ 
++    if (!is_virtual_mod_key(hwnd, key) && state == WL_KEYBOARD_KEY_STATE_PRESSED &&
++        key != KEY_LEFTMETA && key != KEY_RIGHTMETA && key != KEY_CAPSLOCK &&
++        key != KEY_SCROLLLOCK && key != KEY_NUMLOCK)
++        sync_virtual_mods(hwnd, TRUE);
++
+     if (state == WL_KEYBOARD_KEY_STATE_RELEASED) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
+     update_keystate(key, state);
+@@ -1171,6 +1253,7 @@
+                                       uint32_t xkb_group)
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+@@ -1188,6 +1271,8 @@
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
+     set_current_xkb_group(xkb_group);
++
++    if ((hwnd = wayland_keyboard_get_focused_hwnd())) sync_virtual_mods(hwnd, FALSE);
+ }
+ 
+ static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
