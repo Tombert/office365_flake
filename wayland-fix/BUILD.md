@@ -1,11 +1,13 @@
 # Rebuilding `winewayland.so`
 
-`winewayland.so` is GE-Proton11-7's Wayland driver with three changes:
+`winewayland.so` is GE-Proton11-7's Wayland driver with four changes:
 
 * `client-surface-zorder.patch`: stacks the subsurfaces of self-presenting child windows in Win32
   z-order (OneNote's lists, Excel's grid), and again whenever a child window's z-order changes
   (Excel's in-cell editor is raised above the grid only after it is shown).
 * `virtual-modifiers.patch`: Shift, Ctrl and Alt that exist only in the compositor's modifier state.
+* `touch-as-mouse.patch`: touchscreen contacts drive the left mouse button instead of `WM_POINTER`
+  messages (one tap froze PowerPoint).
 * the cursor-shape edit in `build.sh`: `all_resize` sent as `move`.
 
 `build.sh` rebuilds it: it clones GE-Proton11-7 (Wine, wine-staging and libxkbcommon only), applies
@@ -30,6 +32,25 @@ Wine's driver synchronises only Caps, Num and Scroll Lock from the modifier stat
 key press when the compositor reports that modifier and no key for it is down, and releases it when
 the compositor clears the modifier; a real key event for that modifier takes over. Worth sending to
 GE and upstream Wine.
+
+## Touch
+
+GE's driver turns touchscreen contacts into `WM_POINTERDOWN`/`UPDATE`/`UP` hardware messages, and
+Proton's wineserver queues a `WM_POINTERENTER` before the down and a `WM_POINTERLEAVE` after the up.
+Windows sends those two to the window procedure; it never queues them. PowerPoint peeks the queued
+`WM_POINTERENTER` without removing it, over and over (32,000 times in 1.5 s in a `+msg` trace), so
+no mouse or keyboard input reaches it again and its last cursor stays on screen until it is closed.
+Office would not get far with the pointer messages anyway: `GetPointerInfo` is a stub,
+`GetPointerFrameInfoHistory` is not exported, the interaction context is a stub, and
+`GetPointerDevices` reports no devices. The driver also sent the Wayland touch id as the pointer id
+(0 for the first finger, which Windows never uses) and dropped touch motion that actually moved.
+
+`touch-as-mouse.patch` makes the first contact drive the mouse instead: a move to the contact and the
+left button down, moves while it slides, the button up when it lifts (also on `wl_touch.cancel` and
+when the seat loses touch). Contacts that start while it is down are ignored. The touch-down serial
+is kept as the popup grab serial, so a tap opens ribbon dropdowns. Taps, double taps (word
+selection), touch drags (text selection) and dropdowns work in PowerPoint; multi-touch gestures
+such as pinch zoom do not exist this way.
 
 ## Cursor shapes
 
