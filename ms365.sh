@@ -13,7 +13,7 @@
 : "${MS365_EDITION:=64}"                   # 64 | 32
 : "${MS365_EXCLUDE:=Teams OneDrive Lync Bing Groove}"  # ODT ExcludeApp IDs (space separated)
 : "${MS365_ODT_URL:=https://officecdn.microsoft.com/pr/wsus/setup.exe}"
-: "${MS365_WINETRICKS:=corefonts msxml6 riched20 gdiplus}"
+: "${MS365_WINETRICKS:=corefonts msxml6 riched20 gdiplus webview2}"
 : "${MS365_GAMEID:=0}"
 
 OFFICE_ROOT="$MS365_PREFIX/drive_c/Program Files/Microsoft Office/root/Office16"
@@ -747,7 +747,7 @@ Environment (all optional):
   MS365_EDITION   64 | 32           (default 64)
   MS365_LANG      language id       (default en-us)
   MS365_EXCLUDE   ExcludeApp ids    (default "Teams OneDrive Lync Bing Groove")
-  MS365_WINETRICKS verbs applied before install (default "corefonts msxml6 riched20 gdiplus")
+  MS365_WINETRICKS verbs applied before install (default "corefonts msxml6 riched20 gdiplus webview2")
   MS365_ODT_SETUP path to a local ODT setup.exe instead of downloading
   MS365_DEBUG=1   write Proton/Wine debug log to $MS365_HOME/logs/
   MS365_KEEP_SAFEMODE_PROMPT=1  don't auto-clear Office's "start in safe mode?" prompt after a crash
