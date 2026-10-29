@@ -124,6 +124,8 @@ MS365_RUNNER=protosoda MS365_EXCLUDE="Teams OneDrive Lync Bing Groove Outlook On
 * `ms365 exec regedit`, `ms365 exec winecfg`, `ms365 exec cmd`, `ms365 winetricks <verbs>`.
 * `ms365 install download` / `ms365 install configure` rerun a single phase.
 * `ms365 reset --yes` deletes the prefix but keeps the downloaded Office payload.
+* All apps and `ms365 exec` commands on a prefix share one wineserver while any app is open;
+  `ms365 status` shows whether that session is running. `ms365 winetricks` refuses to run then.
 * If a run wedges, `ms365 kill`.
 
 ## What it took (and where it stands)
@@ -150,6 +152,7 @@ Fixes the flake applies automatically, each one found by reading the Wine and Cl
 | Word: splash-screen thread crashes in combase during COM apartment teardown, Office's crash handler kills the app | Word is launched with `/q` |
 | `mso.dll` and friends live in Office's VFS tree; the App-V redirection layer is unreliable under Wine | the VFS tree is mirrored into `Program Files` with symlinks |
 | Office offers safe mode after every crash via a modal prompt | the launcher clears the Resiliency key before starting an app |
+| Two apps open at once each get their own wineserver, so each keeps its own copy of the registry and whichever closes last overwrites the other's changes (settings, sign-in state, `ms365 exec reg` edits) | nixpkgs' umu gives every launch a private `/tmp`, where Wine keeps its server socket. The first app now registers umu's launcher service (`UMU_CONTAINER_NSENTER=1`) and every later app and tool runs inside its container, on its wineserver; a lock keeps two launches at the same moment from each starting one. The service ends when the command it started exits, and kills what it launched, so the first app is started through `keeper/` (`ms365keeper.exe`), which waits as a Wine system process until no app is left. The first app of a session starts about 5 s later than before (umu polls for a running session first); every later one starts in a second or two |
 | Sign-in dies with 53u4r / 12009 after the password (or on the email page) | Wine's winhttp/wininet reject unimplemented option codes with 12009; the shim accepts them (winhttp 77/140, wininet 11) |
 | Licensing dialog fails with E_NOINTERFACE | shim serves `ILanguageStatics` and `IJsonObjectStatics`, which Wine's WinRT factories lack |
 | Word exits at start on the legacy licensing path | product set to vNext licensing mode (LicensingNext = 2), SCA off by default |

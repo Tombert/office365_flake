@@ -84,7 +84,50 @@ umu_env() {
   fi
 }
 
-umu() { umu_env; umu-run "$@"; }
+# One wineserver per prefix. Two servers on the same prefix each keep their own copy of the
+# registry, and whichever exits last writes its copy over the other's changes. nixpkgs' umu gives
+# every launch a private /tmp, where Wine keeps the server's socket, so a launch never finds the
+# server another one started. Instead the first launch registers umu's launcher service on the
+# session bus (UMU_CONTAINER_NSENTER=1), and later apps and tools run inside that container, on its
+# wineserver, until the last app closes (see keeper/keeper.c).
+session_bus() {
+  local sum; sum="$(printf '%s' "$(realpath -m -- "$MS365_PREFIX")" | md5sum)"
+  printf 'com.steampowered.App%s' "${sum%% *}"   # umu names the service after the prefix's md5
+}
+session_bus_ok() {
+  dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1
+}
+session_running() {
+  dbus-send --session --print-reply=literal --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus.NameHasOwner "string:$(session_bus)" 2>/dev/null | grep -q true
+}
+# Taken on fd 9 before looking for a session and held until a session this command starts can be
+# joined, so two commands cannot each start one.
+session_lock() {
+  exec 9>"$MS365_PREFIX/.ms365-session.lock"
+  flock -n 9 && return 0
+  log "waiting for another $MS365_CLI command on this prefix"
+  flock 9
+}
+
+# Run a command in the prefix and wait for it: inside the running session if there is one, else in
+# a container of its own with no launcher service (nothing may join a session that ends with this
+# command), keeping the lock meanwhile so no app starts a second session next to it.
+umu() {
+  umu_env
+  session_lock
+  if session_running; then
+    exec 9>&-
+    # umu runs winetricks in a new container even with UMU_CONTAINER_NSENTER
+    [ "${1:-}" != winetricks ] || die "Office is running on $MS365_PREFIX; close it (or $MS365_CLI kill) before running winetricks"
+    UMU_CONTAINER_NSENTER=1 umu-run "$@"
+  else
+    local rc=0
+    UMU_CONTAINER_NSENTER='' umu-run "$@" 9>&- || rc=$?
+    exec 9>&-
+    return "$rc"
+  fi
+}
 
 ensure_prefix() {
   # The GE runner of 2026-09-23 shipped its template prefix as links into the Nix store, and Proton
@@ -667,6 +710,7 @@ cmd_run() {
       install_shims
     fi
   fi
+  put_dll "$MS365_KEEPER" ms365keeper.exe
   # Default switches: Word's /q skips the splash screen, whose thread trips a COM apartment
   # teardown race in Wine (null deref in combase) that takes the whole app down.
   local defargs=""
@@ -674,13 +718,37 @@ cmd_run() {
   # Files come from file managers and desktop entries as Unix paths; Office needs Windows ones.
   # Proton maps / to Z:, so an existing file becomes Z:\path\to\file (switches such as /q are not
   # files and pass through).
-  local args=() a
+  # shellcheck disable=SC2206
+  local args=(${MS365_APP_ARGS-$defargs}) a
   for a in "$@"; do
     if [ -f "$a" ]; then a="$(realpath -- "$a")"; a="Z:${a//\//\\}"; fi
     args+=("$a")
   done
-  # shellcheck disable=SC2086
-  exec umu-run "$path" ${MS365_APP_ARGS-$defargs} "${args[@]}"
+  if ! session_bus_ok; then
+    warn "no D-Bus session bus, so $app cannot share a wineserver with other Office apps"
+    exec umu-run "$path" "${args[@]}"
+  fi
+  export UMU_CONTAINER_NSENTER=1
+  session_lock
+  if session_running; then
+    exec 9>&-
+    exec umu-run "$path" "${args[@]}"
+  fi
+  # No session yet: this app starts it, under ms365keeper.exe so that it outlives this app when
+  # others join. A launch right behind this one waits on the lock, held here until the session's
+  # launcher service is on the bus (or the launch, exec'd below as this same pid, has gone).
+  ( (
+    for _ in $(seq 240); do
+      session_running && exit 0
+      kill -0 $$ 2>/dev/null || exit 0
+      sleep 0.5
+    done
+  ) </dev/null >/dev/null 2>&1 & )
+  exec 9>&-
+  local winpath="C:${path#"$root/drive_c"}"
+  # In a session of its own: the launcher service in this container runs every app that joins, so
+  # a Ctrl+C in this terminal would stop them all. setsid -f -w still waits and returns the status.
+  exec setsid -f -w umu-run "$root/drive_c/windows/system32/ms365keeper.exe" "${winpath//\//\\}" "${args[@]}"
 }
 
 cmd_winetricks() { umu_env; ensure_prefix; umu winetricks "$@"; }
@@ -708,6 +776,7 @@ cmd_status() {
   local root; root="$(win_prefix_root)"
   echo "runner      : $MS365_RUNNER -> $(runner_path)"
   echo "prefix      : $MS365_PREFIX"
+  echo "session     : $(session_running && echo "running ($(session_bus))" || echo "none")"
   echo "odt dir     : $ODT_DIR"
   echo "product     : $MS365_PRODUCT / $MS365_CHANNEL / x$MS365_EDITION / $MS365_LANG ${MS365_VERSION:+/ pinned $MS365_VERSION}"
   echo "exclude     : $MS365_EXCLUDE"

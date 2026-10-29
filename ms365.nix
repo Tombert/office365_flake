@@ -9,6 +9,8 @@
 , coreutils
 , gnused
 , python3
+, util-linux
+, dbus
 , protonGE
 , protosoda
 , sppcShim
@@ -16,6 +18,7 @@
 , ole32ShimSoda
 , uiaShim
 , d2d1Fix
+, keeper
 , selawik
   # Variant knobs: the same launcher, packaged under another command name with other defaults
   # (e.g. a retail Office 2024 SKU in its own prefix next to Microsoft 365).
@@ -43,7 +46,7 @@ let
 
   cli = writeShellApplication {
     name = cliName;
-    runtimeInputs = [ umu-launcher curl coreutils gnused python3 ];
+    runtimeInputs = [ umu-launcher curl coreutils gnused python3 util-linux dbus ];
     text = ''
       : "''${MS365_CLI:=${cliName}}"
       ${defaultsSh}
@@ -54,10 +57,11 @@ let
       MS365_OLE32_SHIM_SODA=${ole32ShimSoda}/lib/wine/x86_64-windows/ole32.dll
       MS365_UIA_SHIM=${uiaShim}/lib/wine/x86_64-windows/ms365uia.dll
       MS365_D2D1_DLL=${d2d1Fix}/lib/wine/x86_64-windows/d2d1.dll
+      MS365_KEEPER=${keeper}/lib/wine/x86_64-windows/ms365keeper.exe
       MS365_MSI_COMPONENTS=${./msi-components.py}
       MS365_UI_FONTS=${selawik}
       MS365_MESA=${mesa}
-      export MS365_UI_FONTS MS365_MESA MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_MSI_COMPONENTS
+      export MS365_UI_FONTS MS365_MESA MS365_PROTON_GE MS365_PROTOSODA MS365_SPPC_SHIM MS365_OLE32_SHIM_GE MS365_OLE32_SHIM_SODA MS365_UIA_SHIM MS365_D2D1_DLL MS365_KEEPER MS365_MSI_COMPONENTS
       ${builtins.readFile ./ms365.sh}
     '';
   };
