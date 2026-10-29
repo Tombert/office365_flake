@@ -122,6 +122,16 @@ static HRESULT WINAPI my_SLGetGenuineInformation(const void *id, LPCWSTR name, i
     return fn(id, name, type, size, data);
 }
 
+/* combase RoTransformError (api-ms-win-core-winrt-error-l1-1-0/1): Wine's combase exports it as a
+ * stub that aborts the process. The WinRT runtime libraries (vccorlib, C++/WinRT, WinAppSDK)
+ * call it on their error paths, e.g. when the stand-ins below refuse a Windows.Web.Http request
+ * from Outlook's React Native UI, and Outlook died with "unimplemented function
+ * combase.dll.RoTransformError". react-native-win32 looks it up with GetProcAddress and gets Wine's
+ * stub export, so it is overwritten in place (STUBPATCHES). It only reports error context to a
+ * debugger; FALSE = not reported. */
+static BOOL WINAPI my_RoTransformError(HRESULT old_error, HRESULT new_error, void *message)
+{ (void)old_error; (void)new_error; (void)message; return FALSE; }
+
 /* misc: report "not supported" the way the real API does when the feature is absent */
 static HRESULT WINAPI my_DeleteAppContainerProfile(LPCWSTR name) { (void)name; return S_OK; }
 static DWORD WINAPI my_DavFlushFile(HANDLE h) { (void)h; return ERROR_NOT_SUPPORTED; }
@@ -225,6 +235,7 @@ static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
 static const struct patch STUBPATCHES[] = {
     { "oleacc.dll", "CreateStdAccessibleProxyW", (void *)my_CreateStdAccessibleProxyW },
     { "oleacc.dll", "CreateStdAccessibleProxyA", (void *)my_CreateStdAccessibleProxyA },
+    { "combase.dll", "RoTransformError",         (void *)my_RoTransformError },
 };
 #define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
 
@@ -413,15 +424,21 @@ static const struct lang_statics_vtbl lang_statics_vtbl = {
 };
 static lang_statics lang_statics_obj = { &lang_statics_vtbl };
 
+/* Also reached in the passive instance (see other_instance_active): combase calls the WinRT stand-ins'
+ * DllGetActivationFactory in ms365shim.dll, the DllPath registered for them, and when the ole32.dll
+ * instance loaded first (Outlook links ole32 directly) DllMain never set real_GetProcAddress here.
+ * Calling it jumped to address 0, so Outlook's React Native UI got no HttpClient. Fall back to the
+ * plain export lookup. */
 static void resolve_winrt(void)
 {
     if (real_RoGetActivationFactory) return;
     HMODULE cb = GetModuleHandleA("combase.dll");
     if (!cb) cb = LoadLibraryA("combase.dll");
     if (!cb) return;
-    p_WindowsGetStringRawBuffer = (pWindowsGetStringRawBuffer)real_GetProcAddress(cb, "WindowsGetStringRawBuffer");
-    p_WindowsCreateString = (pWindowsCreateString)real_GetProcAddress(cb, "WindowsCreateString");
-    real_RoGetActivationFactory = (pRoGetActivationFactory)real_GetProcAddress(cb, "RoGetActivationFactory");
+    FARPROC (WINAPI *gpa)(HMODULE, LPCSTR) = real_GetProcAddress ? real_GetProcAddress : GetProcAddress;
+    p_WindowsGetStringRawBuffer = (pWindowsGetStringRawBuffer)gpa(cb, "WindowsGetStringRawBuffer");
+    p_WindowsCreateString = (pWindowsCreateString)gpa(cb, "WindowsCreateString");
+    real_RoGetActivationFactory = (pRoGetActivationFactory)gpa(cb, "RoGetActivationFactory");
 }
 
 /* Windows.Data.Json.JsonObject statics (Parse/TryParse). Wine's windows.web has JsonValue statics
@@ -1695,7 +1712,123 @@ static HRESULT WINAPI my_CreateXmlWriter(REFIID iid, void **out, void *malloc)
     return hr;
 }
 
+
+/* ---- shell32: IApplicationAssociationRegistration ----------------------------------------
+ * Outlook asks the shell whether it is the default mail client (QueryAppIsDefaultAll for
+ * "Outlook.Application.16") when an account is added. Wine's shell32 has the class, but
+ * QueryAppIsDefault and QueryAppIsDefaultAll are E_NOTIMPL stubs; Outlook shows the HRESULT as a
+ * "Not Implemented" box and abandons the account setup. CoCreateInstance(Ex) is wrapped: for this
+ * one CLSID the caller gets a thin wrapper whose two queries answer "yes, it is the default" and
+ * whose other methods go to Wine's object. (Wine fix: dlls/shell32/assoc.c, same two methods.) */
+static const GUID CLSID_AAR = {0x591209c7,0x767b,0x42b2,{0x9f,0xba,0x44,0xee,0x46,0x15,0xf2,0xc7}};
+static const GUID IID_AAR   = {0x4e530b0a,0xe611,0x4c77,{0xa3,0xac,0x90,0x31,0xd0,0x22,0x28,0x1b}};
+static const GUID IID_Unk   = {0x00000000,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+typedef struct aar aar;
+typedef struct aar_vtbl {
+    HRESULT (WINAPI *QueryInterface)(aar *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(aar *);
+    ULONG   (WINAPI *Release)(aar *);
+    HRESULT (WINAPI *QueryCurrentDefault)(aar *, LPCWSTR, int, int, LPWSTR *);
+    HRESULT (WINAPI *QueryAppIsDefault)(aar *, LPCWSTR, int, int, LPCWSTR, BOOL *);
+    HRESULT (WINAPI *QueryAppIsDefaultAll)(aar *, int, LPCWSTR, BOOL *);
+    HRESULT (WINAPI *SetAppAsDefault)(aar *, LPCWSTR, LPCWSTR, int);
+    HRESULT (WINAPI *SetAppAsDefaultAll)(aar *, LPCWSTR);
+    HRESULT (WINAPI *ClearUserAssociations)(aar *);
+} aar_vtbl;
+struct aar { const aar_vtbl *vtbl; LONG ref; aar *inner; };   /* inner: Wine's object, same layout */
+
+static HRESULT WINAPI aar_QueryInterface(aar *s, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, &IID_Unk) || IsEqualGUID(iid, &IID_AAR)) { *out = s; InterlockedIncrement(&s->ref); return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI aar_AddRef(aar *s) { return (ULONG)InterlockedIncrement(&s->ref); }
+static ULONG WINAPI aar_Release(aar *s)
+{
+    ULONG r = (ULONG)InterlockedDecrement(&s->ref);
+    if (!r) { if (s->inner) s->inner->vtbl->Release(s->inner); HeapFree(GetProcessHeap(), 0, s); }
+    return r;
+}
+static HRESULT WINAPI aar_QueryCurrentDefault(aar *s, LPCWSTR q, int type, int level, LPWSTR *out)
+{ return s->inner->vtbl->QueryCurrentDefault(s->inner, q, type, level, out); }
+static HRESULT WINAPI aar_QueryAppIsDefault(aar *s, LPCWSTR q, int type, int level, LPCWSTR app, BOOL *def)
+{ (void)s; (void)q; (void)type; (void)level; (void)app; if (!def) return E_POINTER; *def = TRUE; return S_OK; }
+static HRESULT WINAPI aar_QueryAppIsDefaultAll(aar *s, int level, LPCWSTR app, BOOL *def)
+{
+    (void)s; (void)level; (void)app;
+    if (!def) return E_POINTER;
+    *def = TRUE;
+    OutputDebugStringA("ms365 ole32 shim: QueryAppIsDefaultAll -> TRUE");
+    return S_OK;
+}
+static HRESULT WINAPI aar_SetAppAsDefault(aar *s, LPCWSTR app, LPCWSTR ext, int type)
+{ return s->inner->vtbl->SetAppAsDefault(s->inner, app, ext, type); }
+static HRESULT WINAPI aar_SetAppAsDefaultAll(aar *s, LPCWSTR app)
+{ return s->inner->vtbl->SetAppAsDefaultAll(s->inner, app); }
+static HRESULT WINAPI aar_ClearUserAssociations(aar *s)
+{ return s->inner->vtbl->ClearUserAssociations(s->inner); }
+static const aar_vtbl aar_vtable = {
+    aar_QueryInterface, aar_AddRef, aar_Release, aar_QueryCurrentDefault, aar_QueryAppIsDefault,
+    aar_QueryAppIsDefaultAll, aar_SetAppAsDefault, aar_SetAppAsDefaultAll, aar_ClearUserAssociations,
+};
+/* Takes ownership of one reference on inner. */
+static HRESULT aar_wrap(aar *inner, REFIID riid, void **out)
+{
+    aar *s = (aar *)HeapAlloc(GetProcessHeap(), 0, sizeof(*s));
+    if (!s) { inner->vtbl->Release(inner); return E_OUTOFMEMORY; }
+    s->vtbl = &aar_vtable; s->ref = 1; s->inner = inner;
+    HRESULT hr = aar_QueryInterface(s, riid, out);
+    aar_Release(s);
+    return hr;
+}
+typedef HRESULT (WINAPI *pCoCreateInstance)(REFCLSID, IUnknown *, DWORD, REFIID, void **);
+typedef HRESULT (WINAPI *pCoCreateInstanceEx)(REFCLSID, IUnknown *, DWORD, COSERVERINFO *, DWORD, MULTI_QI *);
+static pCoCreateInstance real_CoCreateInstance;
+static pCoCreateInstanceEx real_CoCreateInstanceEx;
+static void resolve_cocreate(void)
+{
+    if (real_CoCreateInstance && real_CoCreateInstanceEx) return;
+    HMODULE h = GetModuleHandleA("combase.dll");
+    if (!h || !real_GetProcAddress) return;
+    if (!real_CoCreateInstance) real_CoCreateInstance = (pCoCreateInstance)real_GetProcAddress(h, "CoCreateInstance");
+    if (!real_CoCreateInstanceEx) real_CoCreateInstanceEx = (pCoCreateInstanceEx)real_GetProcAddress(h, "CoCreateInstanceEx");
+}
+static int aar_iid(REFIID iid) { return IsEqualGUID(iid, &IID_Unk) || IsEqualGUID(iid, &IID_AAR); }
+static HRESULT WINAPI my_CoCreateInstance(REFCLSID clsid, IUnknown *outer, DWORD ctx, REFIID riid, void **out)
+{
+    resolve_cocreate();
+    if (!real_CoCreateInstance) return CO_E_NOTINITIALIZED;
+    if (!outer && out && clsid && riid && IsEqualGUID(clsid, &CLSID_AAR) && aar_iid(riid)) {
+        void *inner = NULL;
+        HRESULT hr = real_CoCreateInstance(clsid, NULL, ctx, &IID_AAR, &inner);
+        if (FAILED(hr) || !inner) return hr;
+        return aar_wrap((aar *)inner, riid, out);
+    }
+    return real_CoCreateInstance(clsid, outer, ctx, riid, out);
+}
+static HRESULT WINAPI my_CoCreateInstanceEx(REFCLSID clsid, IUnknown *outer, DWORD ctx, COSERVERINFO *si, DWORD n, MULTI_QI *mqi)
+{
+    resolve_cocreate();
+    if (!real_CoCreateInstanceEx) return CO_E_NOTINITIALIZED;
+    HRESULT hr = real_CoCreateInstanceEx(clsid, outer, ctx, si, n, mqi);
+    if (!outer && mqi && clsid && IsEqualGUID(clsid, &CLSID_AAR) && (hr == S_OK || hr == CO_S_NOTALLINTERFACES)) {
+        for (DWORD i = 0; i < n; i++) {
+            void *w = NULL;
+            if (mqi[i].hr != S_OK || !mqi[i].pItf || !mqi[i].pIID || !aar_iid(mqi[i].pIID)) continue;
+            if (SUCCEEDED(aar_wrap((aar *)mqi[i].pItf, mqi[i].pIID, &w))) mqi[i].pItf = (IUnknown *)w;
+            else { mqi[i].pItf = NULL; mqi[i].hr = E_OUTOFMEMORY; }
+        }
+    }
+    return hr;
+}
+
 static const struct patch PATCHES[] = {
+    { "ole32.dll",    "CoCreateInstance",            (void *)my_CoCreateInstance },
+    { "ole32.dll",    "CoCreateInstanceEx",          (void *)my_CoCreateInstanceEx },
+    { "combase.dll",  "CoCreateInstance",            (void *)my_CoCreateInstance },
+    { "combase.dll",  "CoCreateInstanceEx",          (void *)my_CoCreateInstanceEx },
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
     { "winhttp.dll",  "WinHttpQueryOption",          (void *)my_WinHttpQueryOption },
@@ -1741,6 +1874,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "virtdisk.dll", NULL },
     { "oleaut32.dll", NULL },
     { "xmllite.dll", NULL },
+    { "ole32.dll", NULL },      /* Office delay-loads ole32: CoCreateInstance(Ex) arrive via GetProcAddress */
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -1808,6 +1942,9 @@ static void note_module(HMODULE h, const char *modname)
             real_InternetSetOptionA = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionA");
             real_InternetQueryOptionW = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionW");
             real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "combase.dll") == 0) {
+            real_CoCreateInstance = (pCoCreateInstance)real_GetProcAddress(h, "CoCreateInstance");
+            real_CoCreateInstanceEx = (pCoCreateInstanceEx)real_GetProcAddress(h, "CoCreateInstanceEx");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "user32.dll") == 0) {
             real_CreateWindowExW = (pCreateWindowExW)real_GetProcAddress(h, "CreateWindowExW");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
