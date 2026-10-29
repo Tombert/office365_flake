@@ -117,21 +117,36 @@ for src in "$link"/share/applications/"$variant"-*.desktop; do
   exe=$(exe_of "$app")
   if [ -z "$exe" ] || [ ! -f "$office/$exe.EXE" ]; then log "skipping $app (not installed)"; continue; fi
 
-  # The app's own icon: the first icon group in its EXE. Office's icons hold one PNG per size, which
+  # The app's own icon: the first icon group in its EXE. Office's icons hold one image per size, which
   # icotool cannot select by size, so the .ico directory is read directly.
   group=$("$SHORTCUTS_ICOUTILS/bin/wrestool" -l -t 14 "$office/$exe.EXE" | head -1 | sed -n 's/.*--name=\([^ ]*\).*/\1/p')
   if [ -n "$group" ] && "$SHORTCUTS_ICOUTILS/bin/wrestool" -x -t 14 -n "$group" -o "$tmp/$app.ico" "$office/$exe.EXE" 2>/dev/null; then
     "$SHORTCUTS_PYTHON/bin/python3" - "$tmp/$app.ico" "$icons_dir" "$name" <<'EOF'
-import os, struct, sys
+import os, struct, sys, zlib
 ico, icons_dir, name = sys.argv[1:]
 data = open(ico, "rb").read()
+def chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
 for i in range(struct.unpack_from("<H", data, 4)[0]):
     w, h, _, _, _, _, size, off = struct.unpack_from("<BBBBHHII", data, 6 + 16 * i)
     w, img = w or 256, data[off:off + size]
-    if w in (16, 24, 32, 48, 64, 128, 256) and w == (h or 256) and img[:8] == b"\x89PNG\r\n\x1a\n":
-        path = os.path.join(icons_dir, f"{w}x{w}", "apps", f"{name}.png")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "wb").write(img)
+    if w not in (16, 24, 32, 48, 64, 128, 256) or w != (h or 256):
+        continue
+    if img[:8] != b"\x89PNG\r\n\x1a\n":
+        # A bitmap instead of a PNG: all of Publisher's icon, and Access's and Outlook's sizes below
+        # 256. Only 32-bit uncompressed ones are kept; their alpha makes the AND mask after the pixels
+        # redundant. The rows are BGRA, bottom-up; PNG wants RGBA, top-down, each after a filter byte.
+        header, _, _, _, bits, compression = struct.unpack_from("<IiiHHI", img)
+        if bits != 32 or compression != 0:
+            continue
+        px = bytearray(img[header:header + w * w * 4])
+        px[0::4], px[2::4] = px[2::4], px[0::4]
+        rows = b"".join(b"\0" + px[y * w * 4:(y + 1) * w * 4] for y in reversed(range(w)))
+        img = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, w, 8, 6, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+    path = os.path.join(icons_dir, f"{w}x{w}", "apps", f"{name}.png")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").write(img)
 EOF
   else
     log "no icon found in $exe.EXE; the menu will show a generic one"
