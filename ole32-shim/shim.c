@@ -1552,6 +1552,118 @@ static void patch_command_lists(void *ctx)
     svg_log("ms365 ole32 shim: ID2D1CommandList EndDraw/DrawImage replay installed");
 }
 
+/* ---- Direct2D: bitmap brushes in pixel unit mode ----------------------------------------------------
+ * In pixel unit mode a bitmap's own DPI does not scale it either: its image space is its size in pixels
+ * (Wine's test_image_bounds checks this on Windows). Wine's d2d1 (through at least 11.18) always lays a
+ * bitmap brush's bitmap out at pixel size * 96 / bitmap DPI. PowerPoint draws every picture on a slide
+ * that way: the bitmap gets the image file's DPI (CreateBitmapFromWicBitmap), and a pixel-mode context
+ * fills a rectangle the image's size in pixels with an identity-transform bitmap brush, which the world
+ * transform scales to the picture's box. A 300 dpi JPEG came out at 96/300 of its box, in the top-left
+ * corner, with its edge pixels stretched over the rest: logos on white became blank white boxes over
+ * whatever lay behind them. While a pixel-mode context fills with a bitmap brush whose bitmap is not at
+ * 96 dpi, Wine gets a brush transform pre-scaled by bitmap DPI / 96. Wine routes FillRectangle,
+ * FillRoundedRectangle and FillEllipse through FillGeometry, so that slot covers the fills. Wine's own
+ * DrawBitmap and DrawImage fill through a bitmap brush too, with a source rectangle already in DIPs, so
+ * fills inside them are left alone, and so are fills recorded into a command list (the replay gets the
+ * fix). MS365_NO_PIXEL_UNITS=1 turns this off too. */
+#define D2D_RT_CREATEBITMAPBRUSH  7
+#define D2D_RT_DRAWBITMAP         26
+#define D2D_BRUSH_SETTRANSFORM    5    /* ID2D1Brush: IUnknown, GetFactory, SetOpacity, SetTransform, GetOpacity, GetTransform */
+#define D2D_BRUSH_GETTRANSFORM    7
+#define D2D_BITMAPBRUSH_GETBITMAP 15
+#define D2D_BITMAP_GETDPI         7    /* ID2D1Bitmap: IUnknown, GetFactory, GetSize, GetPixelSize, GetPixelFormat, GetDpi */
+typedef void (WINAPI *pFillGeometry)(void *, void *, void *, void *);
+typedef void (WINAPI *pRtDrawBitmap)(void *, void *, const my_rect *, float, int, const my_rect *);
+typedef void (WINAPI *pCtxDrawBitmap)(void *, void *, const my_rect *, float, int, const my_rect *, const void *);
+typedef void (WINAPI *pBrushTransform)(void *, my_mat3x2 *);
+static pFillGeometry real_FillGeometry;
+static pRtDrawBitmap real_RtDrawBitmap;
+static pCtxDrawBitmap real_CtxDrawBitmap;
+static pDrawImage real_BitmapDrawImage;
+static void *g_bitmap_brush_vtbl;
+static DWORD g_wine_bitmap_tls = TLS_OUT_OF_INDEXES;   /* non-NULL while Wine draws a bitmap itself */
+static LONG g_bitmap_brush_logs;
+
+/* pre-scale a pixel-mode bitmap brush's transform so that Wine's 96/dpi lands the bitmap at its pixel
+ * size (d2d_brush_fill_cb scales _11/_21 by the width and _12/_22 by the height); FALSE if left alone */
+static BOOL bitmap_brush_begin(void *ctx, void *brush, my_mat3x2 *saved)
+{
+    void *bmp = NULL; float x = 96.0f, y = 96.0f; my_mat3x2 m;
+    if (!brush || *(void **)brush != g_bitmap_brush_vtbl || TlsGetValue(g_wine_bitmap_tls)) return FALSE;
+    if (COM_CALL(ctx, D2D_CTX_GETUNITMODE, pGetUnitMode)(ctx) != MY_UNIT_MODE_PIXELS) return FALSE;
+    COM_CALL(brush, D2D_BITMAPBRUSH_GETBITMAP, void (WINAPI *)(void *, void **))(brush, &bmp);
+    if (!bmp) return FALSE;
+    COM_CALL(bmp, D2D_BITMAP_GETDPI, pGetDpi)(bmp, &x, &y);
+    COM_CALL(bmp, 2, pUnkRelease)(bmp);
+    if ((x == 96.0f && y == 96.0f) || x <= 0.0f || y <= 0.0f) return FALSE;
+    if (target_is_command_list(ctx)) return FALSE;   /* Wine records a copy of the brush; fixed on replay */
+    COM_CALL(brush, D2D_BRUSH_GETTRANSFORM, pBrushTransform)(brush, saved);
+    m = *saved;
+    m._11 *= x / 96.0f; m._21 *= x / 96.0f;
+    m._12 *= y / 96.0f; m._22 *= y / 96.0f;
+    COM_CALL(brush, D2D_BRUSH_SETTRANSFORM, pBrushTransform)(brush, &m);
+    if (InterlockedIncrement(&g_bitmap_brush_logs) <= 3) {
+        char msg[120];
+        wsprintfA(msg, "ms365 ole32 shim: pixel-mode bitmap brush at %d dpi laid out at its pixel size", (int)x);
+        OutputDebugStringA(msg);
+    }
+    return TRUE;
+}
+static void WINAPI my_FillGeometry(void *ctx, void *geometry, void *brush, void *opacity_brush)
+{
+    my_mat3x2 b, o;
+    BOOL fix_b = bitmap_brush_begin(ctx, brush, &b);
+    BOOL fix_o = opacity_brush != brush && bitmap_brush_begin(ctx, opacity_brush, &o);
+    real_FillGeometry(ctx, geometry, brush, opacity_brush);
+    if (fix_b) COM_CALL(brush, D2D_BRUSH_SETTRANSFORM, pBrushTransform)(brush, &b);
+    if (fix_o) COM_CALL(opacity_brush, D2D_BRUSH_SETTRANSFORM, pBrushTransform)(opacity_brush, &o);
+}
+static void WINAPI my_RtDrawBitmap(void *ctx, void *bmp, const my_rect *dst, float opacity, int interp, const my_rect *src)
+{
+    void *prev = TlsGetValue(g_wine_bitmap_tls);
+    TlsSetValue(g_wine_bitmap_tls, (void *)1);
+    real_RtDrawBitmap(ctx, bmp, dst, opacity, interp, src);
+    TlsSetValue(g_wine_bitmap_tls, prev);
+}
+static void WINAPI my_CtxDrawBitmap(void *ctx, void *bmp, const my_rect *dst, float opacity, int interp,
+                                    const my_rect *src, const void *perspective)
+{
+    void *prev = TlsGetValue(g_wine_bitmap_tls);
+    TlsSetValue(g_wine_bitmap_tls, (void *)1);
+    real_CtxDrawBitmap(ctx, bmp, dst, opacity, interp, src, perspective);
+    TlsSetValue(g_wine_bitmap_tls, prev);
+}
+static void WINAPI my_BitmapDrawImage(void *ctx, void *image, const my_pt *offset, const my_rect *image_rect, int interp, int composite)
+{
+    void *prev = TlsGetValue(g_wine_bitmap_tls);
+    TlsSetValue(g_wine_bitmap_tls, (void *)1);
+    real_BitmapDrawImage(ctx, image, offset, image_rect, interp, composite);
+    TlsSetValue(g_wine_bitmap_tls, prev);
+}
+static void patch_pixel_bitmap_brushes(void *ctx)
+{
+    typedef HRESULT (WINAPI *pCreateBitmapBrush)(void *, void *, const void *, const void *, void **);
+    void **vt = *(void ***)ctx, *brush = NULL; DWORD old; char v[4] = "";
+    if (GetEnvironmentVariableA("MS365_NO_PIXEL_UNITS", v, sizeof(v)) && v[0] == '1') return;
+    if (vt[D2D_RT_FILLGEOMETRY] == (void *)my_FillGeometry) return;
+    /* Wine's bitmap brushes share one vtable; a brush without a bitmap is enough to find it */
+    if (FAILED(COM_CALL(ctx, D2D_RT_CREATEBITMAPBRUSH, pCreateBitmapBrush)(ctx, NULL, NULL, NULL, &brush)) || !brush) return;
+    g_bitmap_brush_vtbl = *(void **)brush;
+    COM_CALL(brush, 2, pUnkRelease)(brush);
+    if ((g_wine_bitmap_tls = TlsAlloc()) == TLS_OUT_OF_INDEXES) return;
+    if (!VirtualProtect(vt, (D2D_CTX_DRAWBITMAP + 1) * sizeof(void *), PAGE_READWRITE, &old)) return;
+    real_FillGeometry = (pFillGeometry)vt[D2D_RT_FILLGEOMETRY];
+    real_RtDrawBitmap = (pRtDrawBitmap)vt[D2D_RT_DRAWBITMAP];
+    real_BitmapDrawImage = (pDrawImage)vt[D2D_CTX_DRAWIMAGE];
+    real_CtxDrawBitmap = (pCtxDrawBitmap)vt[D2D_CTX_DRAWBITMAP];
+    vt[D2D_RT_FILLGEOMETRY] = (void *)my_FillGeometry;
+    vt[D2D_RT_DRAWBITMAP] = (void *)my_RtDrawBitmap;
+    vt[D2D_CTX_DRAWIMAGE] = (void *)my_BitmapDrawImage;
+    vt[D2D_CTX_DRAWBITMAP] = (void *)my_CtxDrawBitmap;
+    VirtualProtect(vt, (D2D_CTX_DRAWBITMAP + 1) * sizeof(void *), old, &old);
+    svg_log("ms365 ole32 shim: ID2D1DeviceContext pixel-mode bitmap brushes fixed");
+}
+
 typedef HRESULT (WINAPI *pD2D1CreateFactory)(int, REFIID, const void *, void **);
 static pD2D1CreateFactory real_D2D1CreateFactory;
 static LONG g_svg_vtbl_state;
@@ -1576,6 +1688,7 @@ static void patch_svg_vtable(void *factory)
         }
         patch_axis_aligned_clip(ctx);   /* first: it keeps Wine's own GetDpi */
         patch_unit_mode(ctx);
+        patch_pixel_bitmap_brushes(ctx);   /* before command lists: replayed fills still get the fix */
         patch_command_lists(ctx);
         COM_CALL(ctx, 2, pUnkRelease)(ctx);
     } else svg_log("ms365 ole32 shim: SVG patch: no ID2D1DeviceContext5");
