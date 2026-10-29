@@ -118,8 +118,9 @@ for src in "$link"/share/applications/"$variant"-*.desktop; do
   if [ -z "$exe" ] || [ ! -f "$office/$exe.EXE" ]; then log "skipping $app (not installed)"; continue; fi
 
   # The app's own icon: the first icon group in its EXE. Office's icons hold one PNG per size, which
-  # icotool cannot select by size, so the .ico directory is read directly.
-  group=$("$SHORTCUTS_ICOUTILS/bin/wrestool" -l -t 14 "$office/$exe.EXE" | head -1 | sed -n 's/.*--name=\([^ ]*\).*/\1/p')
+  # icotool cannot select by size, so the .ico directory is read directly. (sed reads the whole
+  # listing: with head -1, wrestool dies of SIGPIPE on MSACCESS.EXE's 81 groups and pipefail stops us.)
+  group=$("$SHORTCUTS_ICOUTILS/bin/wrestool" -l -t 14 "$office/$exe.EXE" | sed -n '1s/.*--name=\([^ ]*\).*/\1/p')
   if [ -n "$group" ] && "$SHORTCUTS_ICOUTILS/bin/wrestool" -x -t 14 -n "$group" -o "$tmp/$app.ico" "$office/$exe.EXE" 2>/dev/null; then
     "$SHORTCUTS_PYTHON/bin/python3" - "$tmp/$app.ico" "$icons_dir" "$name" <<'EOF'
 import os, struct, sys
