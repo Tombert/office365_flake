@@ -108,7 +108,7 @@ All optional, all environment variables:
 | `MS365_HOST_DRIVERS` | unset | on systems other than NixOS the launcher hands Proton the flake's Mesa (see the fixes table); `1` turns that off, e.g. when `/run/opengl-driver` is provided some other way |
 | `MS365_NO_PIXEL_UNITS` | unset | `1` turns off the shim's Direct2D pixel-unit-mode fix (Excel's formula-bar icons, see the fixes table) |
 | `MS365_NO_COMMAND_LISTS` | unset | `1` turns off the shim's Direct2D command-list replay (histograms and the other newer chart types, see the fixes table) |
-| `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver, 96 on X11 |
+| `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver; on X11 the `Xft.dpi` X resource (96 when unset, capped at 180) |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
