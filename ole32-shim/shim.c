@@ -122,6 +122,16 @@ static HRESULT WINAPI my_SLGetGenuineInformation(const void *id, LPCWSTR name, i
     return fn(id, name, type, size, data);
 }
 
+/* combase RoTransformError (api-ms-win-core-winrt-error-l1-1-0/1): Wine's combase exports it as a
+ * stub that aborts the process. The WinRT runtime libraries (vccorlib, C++/WinRT, WinAppSDK)
+ * call it on their error paths, e.g. when a Windows.Web.Http request from Outlook's React Native
+ * UI fails, and Outlook died with "unimplemented function
+ * combase.dll.RoTransformError". react-native-win32 looks it up with GetProcAddress and gets Wine's
+ * stub export, so it is overwritten in place (STUBPATCHES). It only reports error context to a
+ * debugger; FALSE = not reported. */
+static BOOL WINAPI my_RoTransformError(HRESULT old_error, HRESULT new_error, void *message)
+{ (void)old_error; (void)new_error; (void)message; return FALSE; }
+
 /* misc: report "not supported" the way the real API does when the feature is absent */
 static HRESULT WINAPI my_DeleteAppContainerProfile(LPCWSTR name) { (void)name; return S_OK; }
 static DWORD WINAPI my_DavFlushFile(HANDLE h) { (void)h; return ERROR_NOT_SUPPORTED; }
@@ -225,6 +235,7 @@ static FARPROC WINAPI my_GetProcAddress(HMODULE h, LPCSTR name)
 static const struct patch STUBPATCHES[] = {
     { "oleacc.dll", "CreateStdAccessibleProxyW", (void *)my_CreateStdAccessibleProxyW },
     { "oleacc.dll", "CreateStdAccessibleProxyA", (void *)my_CreateStdAccessibleProxyA },
+    { "combase.dll", "RoTransformError",         (void *)my_RoTransformError },
 };
 #define NSTUBPATCHES (sizeof(STUBPATCHES) / sizeof(STUBPATCHES[0]))
 
@@ -413,15 +424,21 @@ static const struct lang_statics_vtbl lang_statics_vtbl = {
 };
 static lang_statics lang_statics_obj = { &lang_statics_vtbl };
 
+/* Also reached in the passive instance (see other_instance_active): combase calls the WinRT classes'
+ * DllGetActivationFactory in ms365shim.dll, the DllPath registered for them, and when the ole32.dll
+ * instance loaded first (Outlook links ole32 directly) DllMain never set real_GetProcAddress here.
+ * Calling it jumped to address 0, so Outlook's React Native UI got no HttpClient. Fall back to the
+ * plain export lookup. */
 static void resolve_winrt(void)
 {
     if (real_RoGetActivationFactory) return;
     HMODULE cb = GetModuleHandleA("combase.dll");
     if (!cb) cb = LoadLibraryA("combase.dll");
     if (!cb) return;
-    p_WindowsGetStringRawBuffer = (pWindowsGetStringRawBuffer)real_GetProcAddress(cb, "WindowsGetStringRawBuffer");
-    p_WindowsCreateString = (pWindowsCreateString)real_GetProcAddress(cb, "WindowsCreateString");
-    real_RoGetActivationFactory = (pRoGetActivationFactory)real_GetProcAddress(cb, "RoGetActivationFactory");
+    FARPROC (WINAPI *gpa)(HMODULE, LPCSTR) = real_GetProcAddress ? real_GetProcAddress : GetProcAddress;
+    p_WindowsGetStringRawBuffer = (pWindowsGetStringRawBuffer)gpa(cb, "WindowsGetStringRawBuffer");
+    p_WindowsCreateString = (pWindowsCreateString)gpa(cb, "WindowsCreateString");
+    real_RoGetActivationFactory = (pRoGetActivationFactory)gpa(cb, "RoGetActivationFactory");
 }
 
 /* Windows.Data.Json.JsonObject statics (Parse/TryParse). Wine's windows.web has JsonValue statics
@@ -499,263 +516,15 @@ static const struct json_statics_vtbl json_statics_vtbl = {
 };
 static json_statics json_statics_obj = { &json_statics_vtbl };
 
-/* ---- Windows.Web.Http stand-ins ----------------------------------------------------------------
- * OneNote's React Native UI (react-native-win32) creates a Windows.Web.Http.Filters.
- * HttpBaseProtocolFilter and an HttpClient when its networking module starts. Wine has no
- * Windows.Web.Http at all; the failed activation throws on the JavaScript thread, Office's error
- * reporting then loops there, and every React Native surface (the notebook navigation pane) stays
- * blank. These stand-ins construct like the real classes (filter settings, cache control, the
- * certificate-validation event, HttpMethod), and every request fails with "cannot connect"
- * (WININET_E_CANNOT_CONNECT), which React Native reports as an ordinary network error. Layouts
- * follow Windows.Foundation.UniversalApiContract.winmd; every out parameter gets its exact width
- * (a WinRT boolean is one byte). */
-#define HTTP_E_CANNOT_CONNECT ((HRESULT)0x80072EFD)
-static const GUID MY_IID_IActivationFactory      = { 0x00000035, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
-static const GUID MY_IID_IClosable               = { 0x30d5a829, 0x7fa4, 0x4026, { 0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e } };
-static const GUID MY_IID_IStringable             = { 0x96369f54, 0x8eb6, 0x48f0, { 0xab, 0xce, 0xc1, 0xb2, 0x11, 0xe6, 0x27, 0xc3 } };
-static const GUID MY_IID_IHttpBaseProtocolFilter = { 0x71c89b09, 0xe131, 0x4b54, { 0xa5, 0x3c, 0xeb, 0x43, 0xff, 0x37, 0xe9, 0xbb } };
-static const GUID MY_IID_IHttpBaseProtocolFilter2= { 0x2ec30013, 0x9427, 0x4900, { 0xa0, 0x17, 0xfa, 0x7d, 0xa3, 0xb5, 0xc9, 0xae } };
-static const GUID MY_IID_IHttpBaseProtocolFilter3= { 0xd43f4d4c, 0xbd42, 0x43ae, { 0x87, 0x17, 0xad, 0x2c, 0x8f, 0x4b, 0x29, 0x37 } };
-static const GUID MY_IID_IHttpBaseProtocolFilter4= { 0x9fe36ccf, 0x2983, 0x4893, { 0x94, 0x1f, 0xeb, 0x51, 0x8c, 0xa8, 0xce, 0xf9 } };
-static const GUID MY_IID_IHttpBaseProtocolFilter5= { 0x416e4993, 0x31e3, 0x4816, { 0xbf, 0x09, 0xe0, 0x18, 0xee, 0x8d, 0xc1, 0xf5 } };
-static const GUID MY_IID_IHttpFilter             = { 0xa4cb6dd5, 0x0902, 0x439e, { 0xbf, 0xd7, 0xe1, 0x25, 0x52, 0xb1, 0x65, 0xce } };
-static const GUID MY_IID_IHttpCacheControl       = { 0xc77e1cb4, 0x3cea, 0x4eb5, { 0xac, 0x85, 0x04, 0xe1, 0x86, 0xe6, 0x3a, 0xb7 } };
-static const GUID MY_IID_IHttpClient             = { 0x7fda1151, 0x3574, 0x4880, { 0xa8, 0xba, 0xe6, 0xb1, 0xe0, 0x06, 0x1f, 0x3d } };
-static const GUID MY_IID_IHttpClient2            = { 0xcdd83348, 0xe8b7, 0x4cec, { 0xb1, 0xb0, 0xdc, 0x45, 0x5f, 0xe7, 0x2c, 0x92 } };
-static const GUID MY_IID_IHttpClient3            = { 0x1172fd01, 0x9899, 0x4194, { 0x96, 0x3f, 0x8f, 0x9d, 0x72, 0xa7, 0xec, 0x15 } };
-static const GUID MY_IID_IHttpClientFactory      = { 0xc30c4eca, 0xe3fa, 0x4f99, { 0xaf, 0xb4, 0x63, 0xcc, 0x65, 0x00, 0x94, 0x62 } };
-static const GUID MY_IID_IHttpMethod             = { 0x728d4022, 0x700d, 0x4fe0, { 0xaf, 0xa5, 0x40, 0x29, 0x9c, 0x58, 0xdb, 0xfd } };
-static const GUID MY_IID_IHttpMethodFactory      = { 0x3c51d10d, 0x36d7, 0x40f8, { 0xa8, 0x6d, 0xe7, 0x59, 0xca, 0xf2, 0xf8, 0x3f } };
-static const GUID MY_IID_IHttpMethodStatics      = { 0x64d171f0, 0xd99a, 0x4153, { 0x8d, 0xc6, 0xd6, 0x8c, 0xc4, 0xcc, 0xe3, 0x17 } };
-static const GUID MY_IID_IHttpRequestMessageFactory = { 0x5bac994e, 0x3886, 0x412e, { 0xae, 0xc3, 0x52, 0xec, 0x7f, 0x25, 0x61, 0x6f } };
+/* ---- Windows.Web.Http ---------------------------------------------------------------------------
+ * Wine has no Windows.Web.Http, nor the Windows.Storage.Streams.DataReader that reads a response
+ * back. Office's React Native surfaces (react-native-win32: OneNote's navigation pane, parts of
+ * Outlook) fetch through them; without an HttpClient OneNote's JavaScript thread dies at start.
+ * webhttp.c implements them on WinHTTP. */
+HRESULT webhttp_get_factory(const WCHAR *name, REFIID iid, void **out);
+static const GUID MY_IID_IActivationFactory = { 0x00000035, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
 
-/* an object is a set of interfaces sharing one refcount; each interface pointer is a {vtbl, obj}
- * pair so methods can find their object */
-#define W_MAXIF 8
-struct wobj;
-struct wif { void *const *vtbl; struct wobj *obj; };
-struct wobj {
-    struct wif ifs[W_MAXIF]; const GUID *iids[W_MAXIF]; int n;
-    LONG ref; BOOL immortal; const WCHAR *clsname;
-    int kind;                 /* factories: which class they make */
-    WCHAR method[24];         /* HttpMethod */
-    struct wobj *cache;       /* filter: its HttpCacheControl */
-    UINT32 read_behavior, write_behavior;
-};
-static LONG g_http_logs;
-static void http_log(const char *m) { if (InterlockedIncrement(&g_http_logs) <= 30) OutputDebugStringA(m); }
-
-static HRESULT WINAPI w_QueryInterface(struct wif *s, REFIID iid, void **out);
-static ULONG WINAPI w_AddRef(struct wif *s) { return s->obj->immortal ? 2 : (ULONG)InterlockedIncrement(&s->obj->ref); }
-static ULONG WINAPI w_Release(struct wif *s)
-{
-    struct wobj *o = s->obj;
-    if (o->immortal) return 1;
-    LONG r = InterlockedDecrement(&o->ref);
-    if (!r) { if (o->cache) w_Release(&o->cache->ifs[0]); HeapFree(GetProcessHeap(), 0, o); }
-    return r;
-}
-static HRESULT WINAPI w_QueryInterface(struct wif *s, REFIID iid, void **out)
-{
-    struct wobj *o = s->obj;
-    if (!out) return E_POINTER;
-    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &MY_IID_IInspectable)) { *out = &o->ifs[0]; w_AddRef(s); return S_OK; }
-    for (int i = 0; i < o->n; i++)
-        if (IsEqualGUID(iid, o->iids[i])) { *out = &o->ifs[i]; w_AddRef(s); return S_OK; }
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-static HRESULT WINAPI w_GetIids(struct wif *s, ULONG *count, GUID **iids) { (void)s; if (count) *count = 0; if (iids) *iids = NULL; return S_OK; }
-static HRESULT hstring_of(const WCHAR *str, HSTRING *out)
-{
-    resolve_winrt();
-    if (!out) return E_POINTER;
-    *out = NULL;
-    return p_WindowsCreateString ? p_WindowsCreateString(str, lstrlenW(str), out) : E_NOTIMPL;
-}
-static HRESULT WINAPI w_GetRuntimeClassName(struct wif *s, HSTRING *name) { return hstring_of(s->obj->clsname, name); }
-static HRESULT WINAPI w_GetTrustLevel(struct wif *s, int *level) { (void)s; if (level) *level = 0; return S_OK; }
-#define W_INSPECTABLE (void *)w_QueryInterface, (void *)w_AddRef, (void *)w_Release, (void *)w_GetIids, (void *)w_GetRuntimeClassName, (void *)w_GetTrustLevel
-
-static HRESULT WINAPI w_ok(void) { return S_OK; }
-static HRESULT WINAPI w_bool_true(struct wif *s, BYTE *v) { (void)s; if (!v) return E_POINTER; *v = 1; return S_OK; }
-static HRESULT WINAPI w_bool_false(struct wif *s, BYTE *v) { (void)s; if (!v) return E_POINTER; *v = 0; return S_OK; }
-static HRESULT WINAPI w_u32_zero(struct wif *s, UINT32 *v) { (void)s; if (!v) return E_POINTER; *v = 0; return S_OK; }
-static HRESULT WINAPI w_obj_null(struct wif *s, void **v) { (void)s; if (!v) return E_POINTER; *v = NULL; return S_OK; }
-static HRESULT WINAPI w_obj_notimpl(struct wif *s, void **v) { (void)s; if (v) *v = NULL; return E_NOTIMPL; }
-/* requests: the async operation out parameter is the last one; one, two or three inputs */
-static HRESULT WINAPI w_fail1(struct wif *s, void *a, void **op) { (void)s; (void)a; if (op) *op = NULL; http_log("ms365 ole32 shim: Windows.Web.Http request refused (stub)"); return HTTP_E_CANNOT_CONNECT; }
-static HRESULT WINAPI w_fail2(struct wif *s, void *a, void *b, void **op) { (void)b; return w_fail1(s, a, op); }
-
-static struct wobj *wobj_new(const WCHAR *clsname, int n, void *const *const *vtbls, const GUID *const *iids)
-{
-    struct wobj *o = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*o));
-    if (!o) return NULL;
-    o->ref = 1; o->clsname = clsname; o->n = n;
-    for (int i = 0; i < n; i++) { o->ifs[i].vtbl = vtbls[i]; o->ifs[i].obj = o; o->iids[i] = iids[i]; }
-    return o;
-}
-
-/* HttpCacheControl */
-static HRESULT WINAPI cc_get_read(struct wif *s, UINT32 *v) { if (!v) return E_POINTER; *v = s->obj->read_behavior; return S_OK; }
-static HRESULT WINAPI cc_put_read(struct wif *s, UINT32 v) { s->obj->read_behavior = v; return S_OK; }
-static HRESULT WINAPI cc_get_write(struct wif *s, UINT32 *v) { if (!v) return E_POINTER; *v = s->obj->write_behavior; return S_OK; }
-static HRESULT WINAPI cc_put_write(struct wif *s, UINT32 v) { s->obj->write_behavior = v; return S_OK; }
-static void *const cachecontrol_vtbl[] = { W_INSPECTABLE, (void *)cc_get_read, (void *)cc_put_read, (void *)cc_get_write, (void *)cc_put_write };
-
-/* HttpBaseProtocolFilter */
-static HRESULT WINAPI f_get_cache(struct wif *s, void **v)
-{
-    if (!v) return E_POINTER;
-    struct wobj *o = s->obj;
-    if (!o->cache) {
-        void *const *vt[] = { cachecontrol_vtbl }; const GUID *ii[] = { &MY_IID_IHttpCacheControl };
-        if (!(o->cache = wobj_new(L"Windows.Web.Http.Filters.HttpCacheControl", 1, vt, ii))) { *v = NULL; return E_OUTOFMEMORY; }
-    }
-    w_AddRef(&o->cache->ifs[0]);
-    *v = &o->cache->ifs[0];
-    return S_OK;
-}
-static HRESULT WINAPI f_get_maxconn(struct wif *s, UINT32 *v) { (void)s; if (!v) return E_POINTER; *v = 6; return S_OK; }
-static HRESULT WINAPI f_get_maxversion(struct wif *s, UINT32 *v) { (void)s; if (!v) return E_POINTER; *v = 2; /* HttpVersion.Http11 */ return S_OK; }
-static HRESULT WINAPI f_add_event(struct wif *s, void *handler, INT64 *token) { (void)s; (void)handler; if (!token) return E_POINTER; *token = 1; return S_OK; }
-static void *const filter_vtbl[] = { W_INSPECTABLE,
-    (void *)w_bool_true, (void *)w_ok,        /* AllowAutoRedirect */
-    (void *)w_bool_false, (void *)w_ok,       /* AllowUI */
-    (void *)w_bool_true, (void *)w_ok,        /* AutomaticDecompression */
-    (void *)f_get_cache,                      /* CacheControl */
-    (void *)w_obj_notimpl,                    /* CookieManager */
-    (void *)w_obj_null, (void *)w_ok,         /* ClientCertificate */
-    (void *)w_obj_notimpl,                    /* IgnorableServerCertificateErrors */
-    (void *)f_get_maxconn, (void *)w_ok,      /* MaxConnectionsPerServer */
-    (void *)w_obj_null, (void *)w_ok,         /* ProxyCredential */
-    (void *)w_obj_null, (void *)w_ok,         /* ServerCredential */
-    (void *)w_bool_true, (void *)w_ok,        /* UseProxy */
-};
-static void *const filter2_vtbl[] = { W_INSPECTABLE, (void *)f_get_maxversion, (void *)w_ok };
-static void *const filter3_vtbl[] = { W_INSPECTABLE, (void *)w_u32_zero, (void *)w_ok };          /* CookieUsageBehavior */
-static void *const filter4_vtbl[] = { W_INSPECTABLE, (void *)f_add_event, (void *)w_ok, (void *)w_ok }; /* ServerCustomValidationRequested, ClearAuthenticationCache */
-static void *const filter5_vtbl[] = { W_INSPECTABLE, (void *)w_obj_null };                        /* User */
-static void *const httpfilter_vtbl[] = { W_INSPECTABLE, (void *)w_fail1 };                        /* SendRequestAsync */
-static void *const closable_vtbl[] = { W_INSPECTABLE, (void *)w_ok };
-static struct wobj *filter_new(void)
-{
-    void *const *vt[] = { filter_vtbl, filter2_vtbl, filter3_vtbl, filter4_vtbl, filter5_vtbl, httpfilter_vtbl, closable_vtbl };
-    const GUID *ii[] = { &MY_IID_IHttpBaseProtocolFilter, &MY_IID_IHttpBaseProtocolFilter2, &MY_IID_IHttpBaseProtocolFilter3,
-                         &MY_IID_IHttpBaseProtocolFilter4, &MY_IID_IHttpBaseProtocolFilter5, &MY_IID_IHttpFilter, &MY_IID_IClosable };
-    http_log("ms365 ole32 shim: created Windows.Web.Http.Filters.HttpBaseProtocolFilter (stub)");
-    return wobj_new(L"Windows.Web.Http.Filters.HttpBaseProtocolFilter", 7, vt, ii);
-}
-
-/* HttpClient */
-static HRESULT WINAPI w_tostring(struct wif *s, HSTRING *v) { return hstring_of(s->obj->clsname, v); }
-static void *const client_vtbl[] = { W_INSPECTABLE,
-    (void *)w_fail1,                          /* DeleteAsync(uri) */
-    (void *)w_fail1, (void *)w_fail2,         /* GetAsync(uri), GetAsync(uri, option) */
-    (void *)w_fail1, (void *)w_fail1, (void *)w_fail1, /* GetBufferAsync, GetInputStreamAsync, GetStringAsync */
-    (void *)w_fail2, (void *)w_fail2,         /* PostAsync(uri, content), PutAsync(uri, content) */
-    (void *)w_fail1, (void *)w_fail2,         /* SendRequestAsync(request), SendRequestAsync(request, option) */
-    (void *)w_obj_notimpl,                    /* DefaultRequestHeaders */
-};
-static void *const client2_vtbl[] = { W_INSPECTABLE,
-    (void *)w_fail1, (void *)w_fail1, (void *)w_fail2, (void *)w_fail1, (void *)w_fail1, (void *)w_fail1,
-    (void *)w_fail2, (void *)w_fail2, (void *)w_fail1, (void *)w_fail2 };
-static void *const client3_vtbl[] = { W_INSPECTABLE, (void *)w_obj_null, (void *)w_ok };          /* DefaultPrivacyAnnotation */
-static void *const stringable_vtbl[] = { W_INSPECTABLE, (void *)w_tostring };
-static struct wobj *client_new(void)
-{
-    void *const *vt[] = { client_vtbl, client2_vtbl, client3_vtbl, closable_vtbl, stringable_vtbl };
-    const GUID *ii[] = { &MY_IID_IHttpClient, &MY_IID_IHttpClient2, &MY_IID_IHttpClient3, &MY_IID_IClosable, &MY_IID_IStringable };
-    http_log("ms365 ole32 shim: created Windows.Web.Http.HttpClient (stub)");
-    return wobj_new(L"Windows.Web.Http.HttpClient", 5, vt, ii);
-}
-
-/* HttpMethod */
-static HRESULT WINAPI m_get_method(struct wif *s, HSTRING *v) { return hstring_of(s->obj->method, v); }
-static void *const method_vtbl[] = { W_INSPECTABLE, (void *)m_get_method };
-static void *const method_stringable_vtbl[] = { W_INSPECTABLE, (void *)m_get_method };
-static HRESULT method_new(const WCHAR *name, void **out)
-{
-    void *const *vt[] = { method_vtbl, method_stringable_vtbl };
-    const GUID *ii[] = { &MY_IID_IHttpMethod, &MY_IID_IStringable };
-    if (!out) return E_POINTER;
-    struct wobj *o = wobj_new(L"Windows.Web.Http.HttpMethod", 2, vt, ii);
-    if (!o) { *out = NULL; return E_OUTOFMEMORY; }
-    lstrcpynW(o->method, name, sizeof(o->method) / sizeof(WCHAR));
-    *out = &o->ifs[0];
-    return S_OK;
-}
-
-/* factories (one immortal object per class) */
-enum { HTTP_FILTER, HTTP_CLIENT, HTTP_METHOD, HTTP_REQUEST, HTTP_NKINDS };
-static HRESULT WINAPI fac_ActivateInstance(struct wif *s, void **out)
-{
-    struct wobj *o = NULL;
-    if (!out) return E_POINTER;
-    *out = NULL;
-    switch (s->obj->kind) {
-    case HTTP_FILTER: o = filter_new(); break;
-    case HTTP_CLIENT: o = client_new(); break;
-    default: return HTTP_E_CANNOT_CONNECT;    /* HttpRequestMessage: requests fail */
-    }
-    if (!o) return E_OUTOFMEMORY;
-    *out = &o->ifs[0];
-    return S_OK;
-}
-static HRESULT WINAPI fac_client_create(struct wif *s, void *filter, void **out)
-{
-    (void)s; (void)filter;
-    struct wobj *o;
-    if (!out) return E_POINTER;
-    if (!(o = client_new())) { *out = NULL; return E_OUTOFMEMORY; }
-    *out = &o->ifs[0];
-    return S_OK;
-}
-static HRESULT WINAPI fac_method_create(struct wif *s, HSTRING name, void **out)
-{
-    (void)s;
-    UINT32 len = 0; const WCHAR *str;
-    resolve_winrt();
-    str = p_WindowsGetStringRawBuffer ? p_WindowsGetStringRawBuffer(name, &len) : NULL;
-    return method_new(str ? str : L"GET", out);
-}
-static HRESULT WINAPI fac_delete(struct wif *s, void **o) { (void)s; return method_new(L"DELETE", o); }
-static HRESULT WINAPI fac_get(struct wif *s, void **o) { (void)s; return method_new(L"GET", o); }
-static HRESULT WINAPI fac_head(struct wif *s, void **o) { (void)s; return method_new(L"HEAD", o); }
-static HRESULT WINAPI fac_options(struct wif *s, void **o) { (void)s; return method_new(L"OPTIONS", o); }
-static HRESULT WINAPI fac_patch(struct wif *s, void **o) { (void)s; return method_new(L"PATCH", o); }
-static HRESULT WINAPI fac_post(struct wif *s, void **o) { (void)s; return method_new(L"POST", o); }
-static HRESULT WINAPI fac_put(struct wif *s, void **o) { (void)s; return method_new(L"PUT", o); }
-static void *const actfactory_vtbl[] = { W_INSPECTABLE, (void *)fac_ActivateInstance };
-static void *const clientfactory_vtbl[] = { W_INSPECTABLE, (void *)fac_client_create };
-static void *const methodfactory_vtbl[] = { W_INSPECTABLE, (void *)fac_method_create };
-static void *const methodstatics_vtbl[] = { W_INSPECTABLE, (void *)fac_delete, (void *)fac_get, (void *)fac_head, (void *)fac_options, (void *)fac_patch, (void *)fac_post, (void *)fac_put };
-static void *const requestfactory_vtbl[] = { W_INSPECTABLE, (void *)w_fail2 };                    /* Create(method, uri) */
-static struct wobj *g_http_factories[HTTP_NKINDS];
-
-static HRESULT http_stub_factory(const WCHAR *name, REFIID iid, void **out)
-{
-    static const WCHAR *const names[HTTP_NKINDS] = {
-        L"Windows.Web.Http.Filters.HttpBaseProtocolFilter", L"Windows.Web.Http.HttpClient",
-        L"Windows.Web.Http.HttpMethod", L"Windows.Web.Http.HttpRequestMessage" };
-    int k;
-    for (k = 0; k < HTTP_NKINDS; k++) if (lstrcmpW(name, names[k]) == 0) break;
-    if (k == HTTP_NKINDS) return REGDB_E_CLASSNOTREG;
-    if (!g_http_factories[k]) {
-        struct wobj *o = NULL;
-        if (k == HTTP_FILTER) { void *const *vt[] = { actfactory_vtbl }; const GUID *ii[] = { &MY_IID_IActivationFactory }; o = wobj_new(names[k], 1, vt, ii); }
-        else if (k == HTTP_CLIENT) { void *const *vt[] = { actfactory_vtbl, clientfactory_vtbl }; const GUID *ii[] = { &MY_IID_IActivationFactory, &MY_IID_IHttpClientFactory }; o = wobj_new(names[k], 2, vt, ii); }
-        else if (k == HTTP_METHOD) { void *const *vt[] = { actfactory_vtbl, methodfactory_vtbl, methodstatics_vtbl }; const GUID *ii[] = { &MY_IID_IActivationFactory, &MY_IID_IHttpMethodFactory, &MY_IID_IHttpMethodStatics }; o = wobj_new(names[k], 3, vt, ii); }
-        else { void *const *vt[] = { actfactory_vtbl, requestfactory_vtbl }; const GUID *ii[] = { &MY_IID_IActivationFactory, &MY_IID_IHttpRequestMessageFactory }; o = wobj_new(names[k], 2, vt, ii); }
-        if (!o) return E_OUTOFMEMORY;
-        o->immortal = TRUE; o->kind = k;
-        if (InterlockedCompareExchangePointer((void **)&g_http_factories[k], o, NULL) != NULL) HeapFree(GetProcessHeap(), 0, o);
-        char msg[160]; wsprintfA(msg, "ms365 ole32 shim: serving %ls (stub)", names[k]); http_log(msg);
-    }
-    return w_QueryInterface(&g_http_factories[k]->ifs[0], iid, out);
-}
-
-/* The launcher registers the stand-in classes under WindowsRuntime\ActivatableClassId with this DLL
+/* The launcher registers the webhttp.c classes under WindowsRuntime\ActivatableClassId with this DLL
  * (as ms365shim.dll) as their DllPath, so combase activates them however the caller reaches
  * RoGetActivationFactory (react-native-win32 resolves it at run time through an API set). */
 __declspec(dllexport) HRESULT WINAPI DllGetActivationFactory(HSTRING cls, void **factory)
@@ -766,7 +535,7 @@ __declspec(dllexport) HRESULT WINAPI DllGetActivationFactory(HSTRING cls, void *
     resolve_winrt();
     name = p_WindowsGetStringRawBuffer ? p_WindowsGetStringRawBuffer(cls, &len) : NULL;
     if (!name) return CLASS_E_CLASSNOTAVAILABLE;
-    HRESULT hr = http_stub_factory(name, &MY_IID_IActivationFactory, factory);
+    HRESULT hr = webhttp_get_factory(name, &MY_IID_IActivationFactory, factory);
     return hr == REGDB_E_CLASSNOTREG ? CLASS_E_CLASSNOTAVAILABLE : hr;
 }
 
@@ -787,8 +556,8 @@ static HRESULT WINAPI my_RoGetActivationFactory(HSTRING cls, REFIID iid, void **
         *out = &json_statics_obj;
         return S_OK;
     }
-    if (name && wcsncmp(name, L"Windows.Web.Http.", 17) == 0) {
-        HRESULT h2 = http_stub_factory(name, iid, out);
+    if (name) {
+        HRESULT h2 = webhttp_get_factory(name, iid, out);
         if (h2 != REGDB_E_CLASSNOTREG) return h2;
     }
     return hr;
@@ -1695,7 +1464,187 @@ static HRESULT WINAPI my_CreateXmlWriter(REFIID iid, void **out, void *malloc)
     return hr;
 }
 
+
+/* ---- shell32: IApplicationAssociationRegistration ----------------------------------------
+ * Outlook asks the shell whether it is the default mail client (QueryAppIsDefaultAll for
+ * "Outlook.Application.16") when an account is added. Wine's shell32 has the class, but
+ * QueryAppIsDefault and QueryAppIsDefaultAll are E_NOTIMPL stubs; Outlook shows the HRESULT as a
+ * "Not Implemented" box and abandons the account setup. CoCreateInstance(Ex) is wrapped: for this
+ * one CLSID the caller gets a thin wrapper whose two queries answer "yes, it is the default" and
+ * whose other methods go to Wine's object. (Wine fix: dlls/shell32/assoc.c, same two methods.) */
+static const GUID CLSID_AAR = {0x591209c7,0x767b,0x42b2,{0x9f,0xba,0x44,0xee,0x46,0x15,0xf2,0xc7}};
+static const GUID IID_AAR   = {0x4e530b0a,0xe611,0x4c77,{0xa3,0xac,0x90,0x31,0xd0,0x22,0x28,0x1b}};
+static const GUID IID_Unk   = {0x00000000,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+typedef struct aar aar;
+typedef struct aar_vtbl {
+    HRESULT (WINAPI *QueryInterface)(aar *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(aar *);
+    ULONG   (WINAPI *Release)(aar *);
+    HRESULT (WINAPI *QueryCurrentDefault)(aar *, LPCWSTR, int, int, LPWSTR *);
+    HRESULT (WINAPI *QueryAppIsDefault)(aar *, LPCWSTR, int, int, LPCWSTR, BOOL *);
+    HRESULT (WINAPI *QueryAppIsDefaultAll)(aar *, int, LPCWSTR, BOOL *);
+    HRESULT (WINAPI *SetAppAsDefault)(aar *, LPCWSTR, LPCWSTR, int);
+    HRESULT (WINAPI *SetAppAsDefaultAll)(aar *, LPCWSTR);
+    HRESULT (WINAPI *ClearUserAssociations)(aar *);
+} aar_vtbl;
+struct aar { const aar_vtbl *vtbl; LONG ref; aar *inner; };   /* inner: Wine's object, same layout */
+
+static HRESULT WINAPI aar_QueryInterface(aar *s, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, &IID_Unk) || IsEqualGUID(iid, &IID_AAR)) { *out = s; InterlockedIncrement(&s->ref); return S_OK; }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI aar_AddRef(aar *s) { return (ULONG)InterlockedIncrement(&s->ref); }
+static ULONG WINAPI aar_Release(aar *s)
+{
+    ULONG r = (ULONG)InterlockedDecrement(&s->ref);
+    if (!r) { if (s->inner) s->inner->vtbl->Release(s->inner); HeapFree(GetProcessHeap(), 0, s); }
+    return r;
+}
+static HRESULT WINAPI aar_QueryCurrentDefault(aar *s, LPCWSTR q, int type, int level, LPWSTR *out)
+{ return s->inner->vtbl->QueryCurrentDefault(s->inner, q, type, level, out); }
+static HRESULT WINAPI aar_QueryAppIsDefault(aar *s, LPCWSTR q, int type, int level, LPCWSTR app, BOOL *def)
+{ (void)s; (void)q; (void)type; (void)level; (void)app; if (!def) return E_POINTER; *def = TRUE; return S_OK; }
+static HRESULT WINAPI aar_QueryAppIsDefaultAll(aar *s, int level, LPCWSTR app, BOOL *def)
+{
+    (void)s; (void)level; (void)app;
+    if (!def) return E_POINTER;
+    *def = TRUE;
+    OutputDebugStringA("ms365 ole32 shim: QueryAppIsDefaultAll -> TRUE");
+    return S_OK;
+}
+static HRESULT WINAPI aar_SetAppAsDefault(aar *s, LPCWSTR app, LPCWSTR ext, int type)
+{ return s->inner->vtbl->SetAppAsDefault(s->inner, app, ext, type); }
+static HRESULT WINAPI aar_SetAppAsDefaultAll(aar *s, LPCWSTR app)
+{ return s->inner->vtbl->SetAppAsDefaultAll(s->inner, app); }
+static HRESULT WINAPI aar_ClearUserAssociations(aar *s)
+{ return s->inner->vtbl->ClearUserAssociations(s->inner); }
+static const aar_vtbl aar_vtable = {
+    aar_QueryInterface, aar_AddRef, aar_Release, aar_QueryCurrentDefault, aar_QueryAppIsDefault,
+    aar_QueryAppIsDefaultAll, aar_SetAppAsDefault, aar_SetAppAsDefaultAll, aar_ClearUserAssociations,
+};
+/* Takes ownership of one reference on inner. */
+static HRESULT aar_wrap(aar *inner, REFIID riid, void **out)
+{
+    aar *s = (aar *)HeapAlloc(GetProcessHeap(), 0, sizeof(*s));
+    if (!s) { inner->vtbl->Release(inner); return E_OUTOFMEMORY; }
+    s->vtbl = &aar_vtable; s->ref = 1; s->inner = inner;
+    HRESULT hr = aar_QueryInterface(s, riid, out);
+    aar_Release(s);
+    return hr;
+}
+typedef HRESULT (WINAPI *pCoCreateInstance)(REFCLSID, IUnknown *, DWORD, REFIID, void **);
+typedef HRESULT (WINAPI *pCoCreateInstanceEx)(REFCLSID, IUnknown *, DWORD, COSERVERINFO *, DWORD, MULTI_QI *);
+static pCoCreateInstance real_CoCreateInstance;
+static pCoCreateInstanceEx real_CoCreateInstanceEx;
+static void resolve_cocreate(void)
+{
+    if (real_CoCreateInstance && real_CoCreateInstanceEx) return;
+    HMODULE h = GetModuleHandleA("combase.dll");
+    if (!h || !real_GetProcAddress) return;
+    if (!real_CoCreateInstance) real_CoCreateInstance = (pCoCreateInstance)real_GetProcAddress(h, "CoCreateInstance");
+    if (!real_CoCreateInstanceEx) real_CoCreateInstanceEx = (pCoCreateInstanceEx)real_GetProcAddress(h, "CoCreateInstanceEx");
+}
+static int aar_iid(REFIID iid) { return IsEqualGUID(iid, &IID_Unk) || IsEqualGUID(iid, &IID_AAR); }
+static HRESULT WINAPI my_CoCreateInstance(REFCLSID clsid, IUnknown *outer, DWORD ctx, REFIID riid, void **out)
+{
+    resolve_cocreate();
+    if (!real_CoCreateInstance) return CO_E_NOTINITIALIZED;
+    if (!outer && out && clsid && riid && IsEqualGUID(clsid, &CLSID_AAR) && aar_iid(riid)) {
+        void *inner = NULL;
+        HRESULT hr = real_CoCreateInstance(clsid, NULL, ctx, &IID_AAR, &inner);
+        if (FAILED(hr) || !inner) return hr;
+        return aar_wrap((aar *)inner, riid, out);
+    }
+    return real_CoCreateInstance(clsid, outer, ctx, riid, out);
+}
+static HRESULT WINAPI my_CoCreateInstanceEx(REFCLSID clsid, IUnknown *outer, DWORD ctx, COSERVERINFO *si, DWORD n, MULTI_QI *mqi)
+{
+    resolve_cocreate();
+    if (!real_CoCreateInstanceEx) return CO_E_NOTINITIALIZED;
+    HRESULT hr = real_CoCreateInstanceEx(clsid, outer, ctx, si, n, mqi);
+    if (!outer && mqi && clsid && IsEqualGUID(clsid, &CLSID_AAR) && (hr == S_OK || hr == CO_S_NOTALLINTERFACES)) {
+        for (DWORD i = 0; i < n; i++) {
+            void *w = NULL;
+            if (mqi[i].hr != S_OK || !mqi[i].pItf || !mqi[i].pIID || !aar_iid(mqi[i].pIID)) continue;
+            if (SUCCEEDED(aar_wrap((aar *)mqi[i].pItf, mqi[i].pIID, &w))) mqi[i].pItf = (IUnknown *)w;
+            else { mqi[i].pItf = NULL; mqi[i].hr = E_OUTOFMEMORY; }
+        }
+    }
+    return hr;
+}
+
+/* ---- combase: IContextCallback::ContextCallback --------------------------------------------
+ * react-native-win32 waits for WinRT async operations with its own awaiter (lessthrow_await_adapter
+ * in react-native-windows): it captures CoGetObjectContext before suspending and resumes the
+ * coroutine from the Completed handler through IContextCallback::ContextCallback. Wine 11's
+ * ContextCallback is a stub that answers E_NOTIMPL, so every operation that had not completed
+ * successfully by the time it was awaited threw instead of resuming, and React Native reported
+ * "Not implemented." The context handed to react-native-win32 (it imports CoGetObjectContext
+ * through api-ms-win-core-com-l1-1-0) is wrapped and remembers the apartment it was captured in. A
+ * callback into the multithreaded apartment from a thread outside any STA, or into the calling
+ * thread's own apartment, needs no marshalling and is made directly, as COM does; anything else
+ * still goes to Wine. (Wine fix: dlls/combase/combase.c, thread_context_callback_ContextCallback.) */
+static const GUID IID_ContextCallback = {0x000001da,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+typedef HRESULT (WINAPI *pContextCall)(void *data);
+typedef struct ctxcb ctxcb;
+typedef struct ctxcb_vtbl {
+    HRESULT (WINAPI *QueryInterface)(ctxcb *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(ctxcb *);
+    ULONG   (WINAPI *Release)(ctxcb *);
+    HRESULT (WINAPI *ContextCallback)(ctxcb *, pContextCall, void *, REFIID, int, IUnknown *);
+} ctxcb_vtbl;
+struct ctxcb { const ctxcb_vtbl *vtbl; LONG ref; ctxcb *inner; BOOL sta; DWORD tid; };  /* inner: Wine's context */
+typedef HRESULT (WINAPI *pCoGetObjectContext)(REFIID, void **);
+static pCoGetObjectContext real_CoGetObjectContext;
+static LONG g_ctx_logs;
+
+static BOOL thread_in_sta(void)
+{
+    APTTYPE type; APTTYPEQUALIFIER qualifier;
+    if (!p_CoGetApartmentType || FAILED(p_CoGetApartmentType(&type, &qualifier))) return FALSE;
+    return type == APTTYPE_STA || type == APTTYPE_MAINSTA;
+}
+static HRESULT WINAPI ctxcb_QueryInterface(ctxcb *s, REFIID iid, void **out)
+{
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, &IID_Unk) || IsEqualGUID(iid, &IID_ContextCallback)) { *out = s; InterlockedIncrement(&s->ref); return S_OK; }
+    return s->inner->vtbl->QueryInterface(s->inner, iid, out);
+}
+static ULONG WINAPI ctxcb_AddRef(ctxcb *s) { return (ULONG)InterlockedIncrement(&s->ref); }
+static ULONG WINAPI ctxcb_Release(ctxcb *s)
+{
+    ULONG r = (ULONG)InterlockedDecrement(&s->ref);
+    if (!r) { s->inner->vtbl->Release(s->inner); HeapFree(GetProcessHeap(), 0, s); }
+    return r;
+}
+static HRESULT WINAPI ctxcb_ContextCallback(ctxcb *s, pContextCall fn, void *data, REFIID iid, int method, IUnknown *unk)
+{
+    if (!fn) return E_INVALIDARG;
+    if (s->tid == GetCurrentThreadId() || (!s->sta && !thread_in_sta())) return fn(data);
+    if (InterlockedIncrement(&g_ctx_logs) <= 10) OutputDebugStringA("ms365 ole32 shim: ContextCallback into another thread's STA left to Wine");
+    return s->inner->vtbl->ContextCallback(s->inner, fn, data, iid, method, unk);
+}
+static const ctxcb_vtbl ctxcb_vtable = { ctxcb_QueryInterface, ctxcb_AddRef, ctxcb_Release, ctxcb_ContextCallback };
+static HRESULT WINAPI my_CoGetObjectContext(REFIID iid, void **out)
+{
+    if (!real_CoGetObjectContext) return CO_E_NOTINITIALIZED;
+    HRESULT hr = real_CoGetObjectContext(iid, out);
+    if (FAILED(hr) || !out || !*out || !iid || !IsEqualGUID(iid, &IID_ContextCallback)) return hr;
+    ctxcb *s = (ctxcb *)HeapAlloc(GetProcessHeap(), 0, sizeof(*s));
+    if (!s) return hr;   /* keep Wine's */
+    s->vtbl = &ctxcb_vtable; s->ref = 1; s->inner = (ctxcb *)*out; s->sta = thread_in_sta(); s->tid = GetCurrentThreadId();
+    *out = s;
+    return hr;
+}
+
 static const struct patch PATCHES[] = {
+    { "ole32.dll",    "CoCreateInstance",            (void *)my_CoCreateInstance },
+    { "ole32.dll",    "CoCreateInstanceEx",          (void *)my_CoCreateInstanceEx },
+    { "combase.dll",  "CoCreateInstance",            (void *)my_CoCreateInstance },
+    { "combase.dll",  "CoCreateInstanceEx",          (void *)my_CoCreateInstanceEx },
     { "kernel32.dll", "GetProcAddress",              (void *)my_GetProcAddress },
     { "winhttp.dll",  "WinHttpSetOption",            (void *)my_WinHttpSetOption },
     { "winhttp.dll",  "WinHttpQueryOption",          (void *)my_WinHttpQueryOption },
@@ -1709,6 +1658,7 @@ static const struct patch PATCHES[] = {
     { "msi.dll",      "MsiGetComponentPathW",        (void *)my_MsiGetComponentPathW },
     { "user32.dll",   "CreateWindowExW",             (void *)my_CreateWindowExW },
     { "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", (void *)my_RoGetActivationFactory },
+    { "api-ms-win-core-com-l1-1-0.dll", "CoGetObjectContext", (void *)my_CoGetObjectContext },
     { "kernel32.dll", "SetFileShortNameW",           (void *)my_SetFileShortNameW },
     { "kernel32.dll", "SetFileShortNameA",           (void *)my_SetFileShortNameA },
     { "kernel32.dll", "FindPackagesByPackageFamily", (void *)my_FindPackagesByPackageFamily },
@@ -1741,6 +1691,7 @@ static struct wrapmod { const char *dll; HMODULE h; } WRAPMODS[] = {
     { "virtdisk.dll", NULL },
     { "oleaut32.dll", NULL },
     { "xmllite.dll", NULL },
+    { "ole32.dll", NULL },      /* Office delay-loads ole32: CoCreateInstance(Ex) arrive via GetProcAddress */
 };
 #define NWRAPMODS (sizeof(WRAPMODS) / sizeof(WRAPMODS[0]))
 /* Office imports msi.dll by ordinal (Windows' msi.dll exports MsiQueryFeatureStateW as #111);
@@ -1808,6 +1759,11 @@ static void note_module(HMODULE h, const char *modname)
             real_InternetSetOptionA = (pInternetSetOption)real_GetProcAddress(h, "InternetSetOptionA");
             real_InternetQueryOptionW = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionW");
             real_InternetQueryOptionA = (pInternetQueryOption)real_GetProcAddress(h, "InternetQueryOptionA");
+        } else if (lstrcmpiA(WRAPMODS[m].dll, "combase.dll") == 0) {
+            real_CoCreateInstance = (pCoCreateInstance)real_GetProcAddress(h, "CoCreateInstance");
+            real_CoCreateInstanceEx = (pCoCreateInstanceEx)real_GetProcAddress(h, "CoCreateInstanceEx");
+            real_CoGetObjectContext = (pCoGetObjectContext)real_GetProcAddress(h, "CoGetObjectContext");
+            p_CoGetApartmentType = (pCoGetApartmentType)real_GetProcAddress(h, "CoGetApartmentType");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "user32.dll") == 0) {
             real_CreateWindowExW = (pCreateWindowExW)real_GetProcAddress(h, "CreateWindowExW");
         } else if (lstrcmpiA(WRAPMODS[m].dll, "d2d1.dll") == 0) {
