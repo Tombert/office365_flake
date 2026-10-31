@@ -187,6 +187,33 @@ apply_dpi() {
   printf '%s' "$dpi" > "$MS365_PREFIX/.ms365-dpi"
 }
 
+# Office's default theme, "Use system setting", asks WinRT UISettings for the app background colour,
+# which Wine derives from the prefix's AppsUseLightTheme; nothing sets that from the desktop, so
+# Office stays light on a dark one. Mirror the desktop's preference from the XDG Settings portal
+# (org.freedesktop.appearance color-scheme: 1 dark, 2 light, 0 none, published by KDE Plasma and
+# GNOME) into both values Windows' "Choose your mode" sets. Wine never tells running apps about a
+# change, so it takes effect on their next start. Without the portal the prefix keeps what it has.
+desktop_light_theme() {
+  local scheme
+  scheme="$(dbus-send --session --reply-timeout=3000 --print-reply=literal --dest=org.freedesktop.portal.Desktop \
+    /org/freedesktop/portal/desktop org.freedesktop.portal.Settings.Read \
+    string:org.freedesktop.appearance string:color-scheme 2>/dev/null)" || return 1
+  case "$scheme" in
+    *"uint32 1"*)      echo 0 ;;
+    *"uint32 "[02]*)   echo 1 ;;
+    *) return 1 ;;
+  esac
+}
+apply_color_scheme() {
+  local light; light="$(desktop_light_theme)" || return 0
+  [ "$(cat "$MS365_PREFIX/.ms365-light-theme" 2>/dev/null)" != "$light" ] || return 0
+  log "following the desktop's $([ "$light" = 0 ] && echo dark || echo light) style"
+  local key='HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+  umu reg add "$key" /v AppsUseLightTheme /t REG_DWORD /d "$light" /f >/dev/null 2>&1 || return 0
+  umu reg add "$key" /v SystemUsesLightTheme /t REG_DWORD /d "$light" /f >/dev/null 2>&1 || true
+  printf '%s' "$light" > "$MS365_PREFIX/.ms365-light-theme"
+}
+
 # Windows path of the default save folder: MS365_SAVE_DIR, else X:\ mapped to $HOME (the mapping is
 # created when the prefix has no X: yet), else the home directory through Z: (Wine's /).
 default_save_dir() {
@@ -647,6 +674,7 @@ cmd_run() {
   if [ "$(cat "$MS365_PREFIX/.ms365-msi-components" 2>/dev/null)" != "$MSI_COMPONENTS_REV" ]; then register_msi_components; fi
   if [ "$(cat "$MS365_PREFIX/.ms365-msforms" 2>/dev/null)" != "$MSFORMS_REV" ]; then register_msforms; fi
   apply_dpi
+  apply_color_scheme
   install_ui_fonts
   # a Proton version bump re-links system32; make sure the shims are still in place (no umu call here,
   # the registry overrides persist, only the files need re-checking)
@@ -754,7 +782,7 @@ Environment (all optional):
   MS365_APP_ARGS  override the default per-app switches (Word: /q = no splash screen); set to "" to disable
   MS365_RADV_DEBUG=<flags>  AMD driver debug flags to export as RADV_DEBUG (default: none)
   MS365_HOST_DRIVERS=1  don't hand Proton the flake's Mesa when /run/opengl-driver is missing (non-NixOS hosts)
-  MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
+  MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white (default: Office's choice, normally the desktop's light/dark style)
   MS365_WAYLAND=0  use X11/Xwayland instead of Wine's Wayland driver (default 1 in a Wayland session)
   MS365_DPI=<n>    Wine dpi (default: 96 * the focused sway output's scale, capped at 180, on the Wayland driver; 96 on X11)
   MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
