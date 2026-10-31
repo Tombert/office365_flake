@@ -1,0 +1,40 @@
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4253,6 +4253,27 @@
+     if (frames != stack_frames) free(frames);
+ }
+ 
++/* Whether a window that keeps its frame beyond a maximized config (see
++ * wayland_surface_get_maximized_frame) still needs wayland_configure_window to
++ * size it to that config. A larger window, such as one maximized to the whole
++ * monitor before the first configure, would otherwise lose its bottom and right
++ * edges outside the window geometry. */
++static BOOL wayland_surface_needs_maximized_resize(struct wayland_surface *surface,
++                                                   const struct wayland_surface_config *conf,
++                                                   RECT rect)
++{
++    SIZE frame;
++
++    if ((conf->state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                        WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) !=
++        WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED)
++        return FALSE;
++    if (!wayland_surface_get_maximized_frame(surface, &frame)) return FALSE;
++
++    return rect.right - rect.left != conf->rect.right - conf->rect.left + 2 * frame.cx ||
++           rect.bottom - rect.top != conf->rect.bottom - conf->rect.top + 2 * frame.cy;
++}
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_xdg
+  *
+@@ -4282,7 +4303,8 @@
+                 WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))) &&
+              surface->current.decor == surface->requested.decor &&
+              wayland_surface_config_is_compatible(&surface->requested, rect,
+-                                                  window->state))
++                                                  window->state) &&
++             !wayland_surface_needs_maximized_resize(surface, &surface->requested, rect))
+     {
+         surface->current = surface->requested;
+         memset(&surface->processing, 0, sizeof(surface->processing));

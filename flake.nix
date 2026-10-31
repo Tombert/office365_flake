@@ -24,7 +24,8 @@
           # GE's Wayland driver stacks the subsurfaces of self-presenting child windows in the order
           # they were created or last moved, not in Win32 z-order, asks for a cursor shape that
           # KDE's compositor rejects, drops Shift that on-screen keyboards set only as a modifier
-          # state, and sends touch as pointer messages that freeze PowerPoint (see wayland-fix/). Swap in the patched winewayland.so. Wine finds its unix libraries next to the resolved ntdll.so, so
+          # state, sends touch as pointer messages that freeze PowerPoint, and leaves the frame of a
+          # maximized window inside its geometry (see wayland-fix/). Swap in the patched winewayland.so. Wine finds its unix libraries next to the resolved ntdll.so, so
           # those (and the loaders in files/bin) are real copies; everything else stays a symlink.
           # The template prefix is copied as it is (real registry files, relative builtin-DLL
           # links): Proton copies it into every new prefix symlinks-as-symlinks, and store symlinks

@@ -1,0 +1,177 @@
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -424,6 +424,7 @@
+     RECT rect;
+     RECT window_rect;
+     RECT client_rect;
++    DWORD style;
+     DWORD exstyle;
+     enum wayland_surface_config_state state;
+     /* The scale (i.e., normalized dpi) the window is rendering at. */
+@@ -606,6 +607,7 @@
+ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
+ POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
+ BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
++BOOL wayland_surface_get_maximized_frame(struct wayland_surface *surface, SIZE *frame);
+ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+ BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
+ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2425,9 +2425,17 @@
+         return FALSE;
+     if (config->serial && (config->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+     {
++        SIZE frame;
++
+         /* Configure rects are already in window coordinates. */
+         width = config->rect.right - config->rect.left;
+         height = config->rect.bottom - config->rect.top;
++        /* Leave room for the frame Windows keeps off-screen. */
++        if (wayland_surface_get_maximized_frame(surface, &frame))
++        {
++            width += 2 * frame.cx;
++            height += 2 * frame.cy;
++        }
+     }
+     else
+     {
+@@ -2446,6 +2454,40 @@
+     return TRUE;
+ }
+ 
++/**********************************************************************
++ *          wayland_surface_get_maximized_frame
++ *
++ * Gets the frame by which Windows extends a maximized window past the work
++ * area on each side (the defaults of win32u's get_min_max_info). Windows keeps
++ * that frame off-screen, and applications that draw their own frame (Office)
++ * clip it away with a window region, so inside the maximized geometry it
++ * would be a transparent strip that passes clicks to the window behind.
++ * Windows whose frame the compositor hides (server-side decorations) have
++ * none.
++ */
++BOOL wayland_surface_get_maximized_frame(struct wayland_surface *surface, SIZE *frame)
++{
++    /* The cached styles: this also runs under the window data lock. */
++    DWORD style = surface->window.style;
++    RECT rect = {0};
++
++    frame->cx = frame->cy = 0;
++
++    if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
++    if (!EqualRect(&surface->window.rect, &surface->window.window_rect)) return FALSE;
++    if ((style & WS_CHILD) || !(style & WS_THICKFRAME)) return FALSE;
++
++    if ((style & WS_CAPTION) == WS_CAPTION) style &= ~WS_BORDER;
++    if (!NtUserAdjustWindowRect(&rect, style, FALSE, surface->window.exstyle,
++                                NtUserGetSystemDpiForProcess(NULL)))
++        return FALSE;
++    if (rect.left >= 0 || rect.top >= 0) return FALSE;
++
++    frame->cx = -rect.left;
++    frame->cy = -rect.top;
++    return TRUE;
++}
++
+ static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *surface,
+                                                        int width, int height)
+ {
+@@ -2498,6 +2540,18 @@
+                             !IsRectEmpty(client) &&
+                             client->right - client->left == current->right - current->left &&
+                             client->bottom - client->top == current->bottom - current->top;
++    BOOL maximized_frame = FALSE;
++    SIZE frame;
++
++    if (!fullscreen_client &&
++        (surface->current.state & surface->window.state &
++         (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) ==
++        WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED &&
++        wayland_surface_get_maximized_frame(surface, &frame))
++    {
++        maximized_frame = rect.right - rect.left >= current->right - current->left + 2 * frame.cx &&
++                          rect.bottom - rect.top >= current->bottom - current->top + 2 * frame.cy;
++    }
+ 
+     /* Keep a fullscreen client's thin frame outside the visible geometry.
+      * Preserve surface-local coordinates for both buffers and pointer input. */
+@@ -2506,6 +2560,13 @@
+         rect = *client;
+         OffsetRect(&rect, -surface->window.rect.left, -surface->window.rect.top);
+     }
++    /* Likewise the frame of a maximized window, which Windows keeps
++     * off-screen. */
++    else if (maximized_frame)
++    {
++        SetRect(&rect, frame.cx, frame.cy, frame.cx + current->right - current->left,
++                frame.cy + current->bottom - current->top);
++    }
+     /* If the window size is bigger than the current state accepts, use the
+      * largest visible (from Windows' perspective) subregion of the window. */
+     else if ((surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+@@ -2541,8 +2602,9 @@
+         int width = rect.right - rect.left, height = rect.bottom - rect.top;
+ 
+         xdg_surface_set_window_geometry(surface->xdg_surface,
+-                                        fullscreen_client ? rect.left : 0,
+-                                        fullscreen_client ? rect.top : 0, width, height);
++                                        fullscreen_client || maximized_frame ? rect.left : 0,
++                                        fullscreen_client || maximized_frame ? rect.top : 0,
++                                        width, height);
+         surface->geometry = rect;
+         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
+         if (!wayland_surface_is_toplevel(surface)) return;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -235,6 +235,7 @@
+     conf->client_rect = data->rects.client;
+     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+     exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
++    conf->style = style;
+     conf->exstyle = exstyle;
+     fullscreen = wayland_win_data_is_fullscreen(data, style);
+ 
+@@ -1071,6 +1072,7 @@
+     BOOL needs_exit_size_move = FALSE;
+     struct wayland_win_data *data;
+     RECT rect;
++    SIZE frame;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface))
+@@ -1151,6 +1153,16 @@
+     window_width = width;
+     window_height = height;
+ 
++    /* Windows extends a maximized window past the work area by its frame on
++     * each side; the surface geometry leaves that frame out. */
++    if ((state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) ==
++        WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED && width && height &&
++        wayland_surface_get_maximized_frame(surface, &frame))
++    {
++        window_width += 2 * frame.cx;
++        window_height += 2 * frame.cy;
++    }
++
+     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
+     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
+     SetRect(&rect, 0, 0, window_width, window_height);
+@@ -1704,6 +1716,7 @@
+     else if (!*state_cmd && !*swp_flags && (data = wayland_win_data_get(hwnd)))
+     {
+         struct surface_output_entry *output_entry;
++        SIZE frame;
+ 
+         if (!(surface = data->wayland_surface)) goto skip;
+         if (!wayland_surface_is_toplevel(surface)) goto skip;
+@@ -1716,6 +1729,9 @@
+ 
+         output_entry = wl_container_of(surface->output_list.next, output_entry, entry);
+         OffsetRect(rect, output_entry->output->current.physical_x, output_entry->output->current.physical_y);
++        /* a maximized window's frame stays beyond the output, see wayland_configure_window */
++        if ((style & WS_MAXIMIZE) && wayland_surface_get_maximized_frame(surface, &frame))
++            OffsetRect(rect, -frame.cx, -frame.cy);
+ 
+         TRACE("Moving hwnd=%p to %s\n", hwnd, wine_dbgstr_rect(rect));
+ 

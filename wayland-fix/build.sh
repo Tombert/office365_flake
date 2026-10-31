@@ -44,6 +44,8 @@ cd "$W"
 patch -p1 < "$here/client-surface-zorder.patch"
 patch -p1 < "$here/virtual-modifiers.patch"
 patch -p1 < "$here/touch-as-mouse.patch"
+patch -p1 < "$here/maximized-frame.patch"
+patch -p1 < "$here/maximized-resize.patch"
 # cursor shapes: all_resize -> move (see BUILD.md)
 sed -i 's/\(OCR_SIZE\(ALL\)\?, *\)WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_RESIZE/\1WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE/' \
     dlls/winewayland.drv/wayland_pointer.c

@@ -1,6 +1,6 @@
 # Rebuilding `winewayland.so`
 
-`winewayland.so` is GE-Proton11-7's Wayland driver with four changes:
+`winewayland.so` is GE-Proton11-7's Wayland driver with six changes:
 
 * `client-surface-zorder.patch`: stacks the subsurfaces of self-presenting child windows in Win32
   z-order (OneNote's lists, Excel's grid), and again whenever a child window's z-order changes
@@ -8,6 +8,12 @@
 * `virtual-modifiers.patch`: Shift, Ctrl and Alt that exist only in the compositor's modifier state.
 * `touch-as-mouse.patch`: touchscreen contacts drive the left mouse button instead of `WM_POINTER`
   messages (one tap froze PowerPoint).
+* `maximized-frame.patch`: a maximized window extends past the compositor's area by its frame, as
+  on Windows, and the surface geometry leaves the frame out (a dead strip along the top and left of
+  maximized Office windows on KDE Plasma).
+* `maximized-resize.patch` (needs `maximized-frame.patch`): a window maximized before the
+  compositor's first configure is resized to the configured size before that configure is
+  acknowledged (Word's status bar was behind KDE Plasma's panel).
 * the cursor-shape edit in `build.sh`: `all_resize` sent as `move`.
 
 `build.sh` rebuilds it: it clones GE-Proton11-7 (Wine, wine-staging and libxkbcommon only), applies
@@ -51,6 +57,40 @@ when the seat loses touch). Contacts that start while it is down are ignored. Th
 is kept as the popup grab serial, so a tap opens ribbon dropdowns. Taps, double taps (word
 selection), touch drags (text selection) and dropdowns work in PowerPoint; multi-touch gestures
 such as pinch zoom do not exist this way.
+
+## Maximized windows
+
+Windows maximizes a window with a resize frame to the work area grown by that frame on every side
+(`get_min_max_info`: position `-frame`, size `work area + 2 * frame`), so the frame is off-screen.
+Office draws its own title bar and frame and gives a maximized window a window region without the
+part outside its monitor, which is that frame (5 px at 144 dpi). GE's driver instead made the whole
+Win32 window exactly the configured maximized size (`WAYLAND_GetWindowMaxTrackSize` caps it there,
+and `wayland_configure_window` sizes it there) and set the window geometry at (0, 0), so the clipped
+frame was inside the geometry: a transparent strip, 3 px at 1.5x scale, along the top and left of
+maximized Word on KDE Plasma, where clicks reached the window behind it. Flinging the pointer to the
+top edge or a corner, to the title bar or the close button, lands there.
+
+`maximized-frame.patch` computes that frame the way win32u does (`AdjustWindowRect` of the style
+without `WS_BORDER`, at the system dpi), for toplevels with `WS_THICKFRAME` whose frame the
+compositor does not hide (no server-side decorations). Maximized, the max track size and the size
+`wayland_configure_window` sets include it, and the window geometry starts at the frame, like the
+existing case for a fullscreen client's thin frame. The surface beyond the geometry is the frame,
+which such applications leave transparent and without input, and on Windows is off-screen too.
+
+GE's driver also moves a toplevel's Win32 position to the origin of its output whenever it refreshes
+the window state (output enter and leave, focus changes). The patch moves a maximized window to that
+origin minus the frame instead; at the origin itself Office's region would lose its left and top
+inset and stop 5 px short of the right edge, which moves the dead strip there.
+
+A maximized configure is acknowledged straight from the compositor's request, without the Win32
+resize, when the window is at least that large. Office starts maximized before its first configure,
+which Win32 sizes for the whole output (Wine's work area under Wayland), so Word's status bar stayed
+below the geometry, behind the panel (also with GE's own driver). `maximized-resize.patch` makes that
+shortcut need exactly the configured size plus the frame for windows with the frame; otherwise
+`wayland_configure_window` resizes the window first.
+
+At 1.5x the 5 px frame is 3 1/3 logical pixels and the geometry offset is 3, so the frame can leave
+half a physical pixel at the edges; input reaches the window there.
 
 ## Cursor shapes
 
