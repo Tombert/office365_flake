@@ -13,8 +13,8 @@
 `build.sh` rebuilds it: it clones GE-Proton11-7 (Wine, wine-staging and libxkbcommon only), applies
 the Wine part of GE's `patches/protonprep-valve-staging.sh`, then these changes, and compiles just the
 driver in the Steam Runtime SDK image GE's Makefile names (`STEAMRT_IMAGE`), with GE's compiler flags
-and configure options. It needs git, patch and Docker, takes about two minutes once the SDK image is
-pulled, and writes `winewayland.so` here.
+and configure options. It needs git, patch and Podman (rootless works) or Docker, takes about two
+minutes once the SDK image is pulled, and writes `winewayland.so` here.
 
 Checked on 2026-09-24: built without `virtual-modifiers.patch`, the driver disassembles to the same
 instructions as the one built with GE's full build (only addresses and embedded source paths differ),

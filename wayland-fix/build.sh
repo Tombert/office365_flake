@@ -2,11 +2,11 @@
 # Rebuilds wayland-fix/winewayland.so: GE-Proton11-7's Wayland driver with the changes in this
 # directory, compiled in Valve's Steam Runtime SDK container (the toolchain and libraries GE builds
 # with, so it loads next to the rest of GE's Wine). Only the driver is built, not all of GE: about
-# ten minutes and a few GB (Wine source; the SDK image is 9 GB if Docker does not have it yet).
+# ten minutes and a few GB (Wine source; the SDK image is 9 GB if it is not pulled yet).
 #
 #   wayland-fix/build.sh [workdir]        (default: ~/.cache/ge-wayland-build)
 #
-# Needs git, patch, Docker. Writes wayland-fix/winewayland.so.
+# Needs git, patch, Podman or Docker. Writes wayland-fix/winewayland.so.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -15,8 +15,11 @@ TAG=GE-Proton11-7
 IMG=registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64:4.0.20260714.251823-0  # STEAMRT_IMAGE in GE's Makefile.in
 W=$B/proton-ge-custom/wine
 
+# Podman if there is one (rootless: keep-id runs as this user's own uid, which owns the work dir), else Docker
+if command -v podman >/dev/null; then ctr=(podman run --userns=keep-id); else ctr=(docker run); fi
+
 run() {  # run <dir> <script>: in the SDK container, as this user, with the work dir mounted
-    docker run --rm -v "$B:$B" -w "$1" -e HOME="$B" -e CCACHE_DISABLE=1 -e XDG_CACHE_HOME="$B/xdg-cache" \
+    "${ctr[@]}" --rm -v "$B:$B" -w "$1" -e HOME="$B" -e CCACHE_DISABLE=1 -e XDG_CACHE_HOME="$B/xdg-cache" \
         -u "$(id -u):$(id -g)" "$IMG" bash -euc "$2"
 }
 
