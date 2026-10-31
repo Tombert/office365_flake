@@ -163,8 +163,9 @@ apply_tricks() {
 }
 
 # Wine's Wayland driver exposes outputs at their physical size, so on a HiDPI panel Office renders
-# tiny at 96 dpi. MS365_DPI sets Wine's dpi; unset, it follows the focused sway output's scale on
-# the Wayland driver (96 * scale) and stays 96 on Xwayland, which scales by itself. Capped at 180:
+# tiny at 96 dpi. MS365_DPI sets Wine's dpi; unset, it follows the output scale on the Wayland
+# driver (96 * scale): the focused output under sway, the primary one under KDE Plasma (KWin has no
+# focused output to ask for). It stays 96 on Xwayland, which scales by itself. Capped at 180:
 # at exactly 192 dpi Word overflows its main thread's stack while building its first window (an
 # Office recursion, same on GE-Proton 11-6 and 11-7); 180 renders and behaves fine.
 wine_dpi() {
@@ -174,6 +175,13 @@ wine_dpi() {
 import json, sys
 outs = json.load(sys.stdin)
 o = next((o for o in outs if o.get("focused")), outs[0] if outs else {})
+print(min(180, int(round(96 * float(o.get("scale", 1))))))' 2>/dev/null && return
+  fi
+  if [ "${MS365_WAYLAND:-1}" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ] && command -v kscreen-doctor >/dev/null 2>&1; then
+    kscreen-doctor -j 2>/dev/null | python3 -c '
+import json, sys
+outs = [o for o in json.load(sys.stdin).get("outputs", []) if o.get("enabled")]
+o = min(outs, key=lambda o: o.get("priority") or 99) if outs else {}
 print(min(180, int(round(96 * float(o.get("scale", 1))))))' 2>/dev/null && return
   fi
   echo 96
@@ -756,7 +764,7 @@ Environment (all optional):
   MS365_HOST_DRIVERS=1  don't hand Proton the flake's Mesa when /run/opengl-driver is missing (non-NixOS hosts)
   MS365_THEME=<n>  pin the Office theme: 0 colorful, 3 dark gray, 4 black, 5 white
   MS365_WAYLAND=0  use X11/Xwayland instead of Wine's Wayland driver (default 1 in a Wayland session)
-  MS365_DPI=<n>    Wine dpi (default: 96 * the focused sway output's scale, capped at 180, on the Wayland driver; 96 on X11)
+  MS365_DPI=<n>    Wine dpi (default: 96 * the output scale (focused sway output, primary KDE output), capped at 180, on the Wayland driver; 96 on X11)
   MS365_WINEDEBUG=<channels>  with MS365_DEBUG=1: replace Proton's Wine debug channel list
   MS365_SCA=1     use Shared Computer Activation instead of vNext licensing (business subscriptions only)
   UMU_LOG=debug   verbose umu output

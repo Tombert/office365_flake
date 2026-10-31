@@ -108,7 +108,7 @@ All optional, all environment variables:
 | `MS365_HOST_DRIVERS` | unset | on systems other than NixOS the launcher hands Proton the flake's Mesa (see the fixes table); `1` turns that off, e.g. when `/run/opengl-driver` is provided some other way |
 | `MS365_NO_PIXEL_UNITS` | unset | `1` turns off the shim's Direct2D pixel-unit-mode fix (Excel's formula-bar icons, see the fixes table) |
 | `MS365_NO_COMMAND_LISTS` | unset | `1` turns off the shim's Direct2D command-list replay (histograms and the other newer chart types, see the fixes table) |
-| `MS365_DPI` | unset | Wine dpi. Unset: 96 × the focused sway output's scale (capped at 180, see "Known problems") on the Wayland driver, 96 on X11 |
+| `MS365_DPI` | unset | Wine dpi. Unset: 96 × the output scale on the Wayland driver (the focused output under sway, the primary output under KDE Plasma; capped at 180, see "Known problems"), 96 on X11 |
 | `UMU_LOG` | unset | `1` or `debug` for umu output |
 
 Example, try the Soda core with a minimal install:
@@ -238,12 +238,12 @@ on Wine's `JsonValue`).
   sway's Xwayland layer moves keyboard focus back to the main window in between; Wine then sends
   Office the message that cancels the menu. The Wayland driver, the default, keeps focus inside Wine.
 * **Wayland driver and HiDPI.** The driver reports the monitor at 96 dpi, so the launcher sets Wine's
-  dpi from the sway output scale. At exactly 192 dpi Word overflows its main thread's stack while
-  building its first window (an Office recursion; same on GE-Proton 11-6 and 11-7), so the automatic
-  value is capped at 180, which renders and takes input correctly on GE-Proton11-7. GE-Proton11-6's
-  driver mixed pixel and logical coordinates in the window geometry (input offset, no input at all
-  at 168/180 dpi) and could get disconnected for committing a surface before its configure; the
-  flake pins 11-7 for its Wayland fixes.
+  dpi from the output scale (sway's focused output, KDE Plasma's primary one). At exactly 192 dpi
+  Word overflows its main thread's stack while building its first window (an Office recursion; same
+  on GE-Proton 11-6 and 11-7), so the automatic value is capped at 180, which renders and takes
+  input correctly on GE-Proton11-7. GE-Proton11-6's driver mixed pixel and logical coordinates in
+  the window geometry (input offset, no input at all at 168/180 dpi) and could get disconnected for
+  committing a surface before its configure; the flake pins 11-7 for its Wayland fixes.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
   GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the
