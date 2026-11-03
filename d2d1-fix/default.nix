@@ -25,6 +25,19 @@ stdenvNoCC.mkDerivation {
     sig="Wine builtin DLL"
     [ "$(dd if=d2d1.dll bs=1 skip=64 count=16 2>/dev/null)" = "$sig" ] || { echo "no builtin signature at offset 64"; exit 1; }
     printf 'ms365 native DLL' | dd of=d2d1.dll bs=1 seek=64 count=16 conv=notrunc 2>/dev/null
+
+    # Patch quadratic Bézier self-intersection calculation freeze in d2d_geometry_sink_Close.
+    # When Office renders floating ribbon popups ("Show tabs only" mode), Direct2D
+    # gets trapped calculating bezier segment self-intersections in O(N^2), causing a ~65s UI lockup.
+    # Wine 11.16 offset 0x2f92c: 0f 84 5c 09 00 00 (je 0x18003028e) -> e9 5d 09 00 00 90 (jmp 0x18003028e; nop)
+    patch_offset=194860
+    orig_bytes=$(dd if=d2d1.dll bs=1 skip=$patch_offset count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$orig_bytes" = "0f845c090000" ]; then
+      printf '\xe9\x5d\x09\x00\x00\x90' | dd of=d2d1.dll bs=1 seek=$patch_offset count=6 conv=notrunc 2>/dev/null
+      echo "d2d1-fix: patched bezier self-intersection loop at offset $patch_offset"
+    else
+      echo "d2d1-fix: note: offset $patch_offset has bytes '$orig_bytes', skipping bezier bypass"
+    fi
     runHook postBuild
   '';
   installPhase = ''
