@@ -245,7 +245,10 @@ on Wine's `JsonValue`).
   at 168/180 dpi) and could get disconnected for committing a surface before its configure; the
   flake pins 11-7 for its Wayland fixes.
 * **Direct2D comes from a different Wine** (`d2d1-fix/`): nixpkgs' Wine 11.16 `d2d1.dll` runs on
-  GE-Proton 11's Wine 11.0. It only depends on public DLL interfaces, but if a future Proton bumps its
+  GE-Proton 11's Wine 11.0. It also includes an in-place patch bypassing an $O(N^2)$ quadratic
+  Bézier curve self-intersection loop in `d2d_geometry_sink_Close` that otherwise causes a ~65-second
+  UI freeze when rendering floating ribbon dropdowns and rounded-corner menus ("Show tabs only" mode).
+  It only depends on public DLL interfaces, but if a future Proton bumps its
   Wine past the fix the override becomes unnecessary; if a future nixpkgs Wine adds a dependency the
   Proton base lacks, the launcher's log will show `d2d1` failing to load.
 
