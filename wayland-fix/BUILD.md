@@ -1,6 +1,6 @@
 # Rebuilding `winewayland.so`
 
-`winewayland.so` is GE-Proton11-7's Wayland driver with four changes:
+`winewayland.so` is GE-Proton11-7's Wayland driver with five changes:
 
 * `client-surface-zorder.patch`: stacks the subsurfaces of self-presenting child windows in Win32
   z-order (OneNote's lists, Excel's grid), and again whenever a child window's z-order changes
@@ -8,6 +8,8 @@
 * `virtual-modifiers.patch`: Shift, Ctrl and Alt that exist only in the compositor's modifier state.
 * `touch-as-mouse.patch`: touchscreen contacts drive the left mouse button instead of `WM_POINTER`
   messages (one tap froze PowerPoint).
+* `caplok-letters.patch`: letters' Caps Lock as `CAPLOK`, not an `SGCAPS` pair (Ctrl+C, Ctrl+V and
+  Ctrl+Z did nothing in Word).
 * the cursor-shape edit in `build.sh`: `all_resize` sent as `move`.
 
 `build.sh` rebuilds it: it clones GE-Proton11-7 (Wine, wine-staging and libxkbcommon only), applies
@@ -32,6 +34,29 @@ Wine's driver synchronises only Caps, Num and Scroll Lock from the modifier stat
 key press when the compositor reports that modifier and no key for it is down, and releases it when
 the compositor clears the modifier; a real key event for that modifier takes over. Worth sending to
 GE and upstream Wine.
+
+## Caps Lock on letters
+
+GE's driver builds the Windows layout table from the compositor's xkb keymap. For every key where
+Caps Lock changes the character it writes an `SGCAPS` pair: an entry with the Caps Lock characters,
+then the normal one. On letters xkb gives `C` for Caps+c, so every letter got such a pair
+(`vkey 0x0043 + CAPS -> "Cc..."`, then `vkey 0x0043 -> "cC..."`). win32u's `ToUnicode` skips the Caps
+Lock entry when Caps Lock is off, but `VkKeyScanEx` returns the first entry holding the character and
+found `c` at Shift in the Caps Lock entry: `VkKeyScanEx('c')` was `0x143`, Shift+C, and `'a'` to `'z'`
+likewise (`0x043` under X11, whose driver answers `VkKeyScanEx` itself). Word builds its shortcuts
+from those answers at startup, so copy, paste and undo sat on Ctrl+Shift+C/V/Z and Ctrl+C, Ctrl+V and
+Ctrl+Z did nothing; Ctrl+F, which Word does not look up by character, worked.
+
+Windows' own layouts mark such keys `CAPLOK` (Caps Lock acts as Shift) and keep `SGCAPS` for keys where
+the two differ. `caplok-letters.patch` does the same: when every Caps Lock character of a key is the
+character of the other Shift state, the key gets `CAPLOK` (the driver's existing branch) instead of
+the pair. Dead keys keep their pair.
+
+Side effect: with Caps Lock on, Shift+letter types a capital as well. win32u turns Caps Lock on a
+`CAPLOK` key into an added Shift (`kbd_tables_get_mod_num`: `bits |= KBDSHIFT`) instead of toggling
+it as Windows does; the `SGCAPS` pair used to hide that by listing the lowercase letter at Shift.
+Fixing both takes win32u (`VkKeyScanEx` skipping the Caps Lock entry, or Caps Lock toggling Shift),
+which the flake does not replace; working Ctrl shortcuts are the better trade.
 
 ## Touch
 
