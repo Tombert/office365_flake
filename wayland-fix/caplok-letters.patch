@@ -1,0 +1,29 @@
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -545,6 +545,26 @@
+
+         if (!found) continue;
+
++        /* Caps Lock that only swaps the case, as on letters, is CAPLOK in Windows' own layouts, not
++         * an SGCAPS pair. With the pair, VkKeyScanEx (which scans the entries in order and does not
++         * skip the Caps Lock one) found 'c' at Shift in the Caps Lock entry and returned Shift+C, so
++         * Office bound copy, paste and undo to Ctrl+Shift+C/V/Z. */
++        if (caps_found)
++        {
++            BOOL caps_is_shift = TRUE;
++
++            for (mod = 0; mod < 8; ++mod)
++            {
++                if (caps_vkey2wch.wch[mod] == WCH_NONE) continue;
++                if (caps_vkey2wch.wch[mod] != vkey2wch.wch[mod ^ 1])
++                {
++                    caps_is_shift = FALSE;
++                    break;
++                }
++            }
++            if (caps_is_shift) caps_found = FALSE;
++        }
++
+         if (caps_found)
+         {
+             TRACE("vkey %#06x + CAPS -> %s\n", caps_vkey2wch.VirtualKey, debugstr_wn(caps_vkey2wch.wch, 8));
